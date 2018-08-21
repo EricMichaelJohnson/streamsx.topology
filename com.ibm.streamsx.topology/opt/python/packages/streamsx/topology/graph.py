@@ -10,6 +10,7 @@ import sys
 import uuid
 import json
 import inspect
+import datetime
 import pickle
 from enum import Enum
 
@@ -55,6 +56,16 @@ def _as_spl_expr(value):
         value = streamsx.spl.op.Expression.expression(value.name)
     return value
 
+# Return a value suitable for use inthe JSON used to
+# create the SPL. Returns `value.spl_json() if value has it otherwise
+# fn(value) or value if fn is not supplied.
+def _as_spl_json(value, fn=None):
+    if hasattr(value, 'spl_json'):
+        return value.spl_json()
+    if fn:
+        return fn(value)
+    return value
+
 class SPLGraph(object):
 
     def __init__(self, topology, name=None, namespace=None):
@@ -77,6 +88,16 @@ class SPLGraph(object):
         self._used_names = {'list', 'tuple', 'int'}
         self._layout_group_id = 0
         self._colocate_tag_mapping = {}
+        self._id_gen = 0
+
+    def _unique_id(self, prefix):
+        """
+        Generate a unique (within the graph) identifer
+        internal to graph generation.
+        """
+        _id = self._id_gen
+        self._id_gen += 1
+        return prefix + str(_id)
 
     def get_views(self):
         return self._views
@@ -163,10 +184,12 @@ class SPLGraph(object):
         _graph["namespace"] = self.namespace
         _graph["public"] = True
         _graph["config"] = {}
+        self._determine_model(_graph["config"])
         _graph["config"]["includes"] = []
         _graph['config']['spl'] = {}
         _graph['config']['spl']['toolkits'] = self._spl_toolkits
         self._add_parameters(_graph)
+        self._add_checkpoint(_graph)
         if self._colocate_tag_mapping:
             _graph['config']['colocateTagMapping'] = self._colocate_tag_mapping
         _ops = []
@@ -178,7 +201,20 @@ class SPLGraph(object):
 
         _graph["operators"] = _ops
         return _graph
-   
+
+    def _determine_model(self, graph_cfg):
+        # Python can be used to build pure SPL
+        # graphs so if that's the case mark the
+        # graph model/langauge as spl/spl
+        all_spl = True
+        for op in self.operators:
+            if op.model != 'spl':
+                all_spl = False
+                break
+
+        graph_cfg['model'] = 'spl' if all_spl else 'functional' 
+        graph_cfg['language'] = 'spl' if all_spl else 'python'
+
     def _add_packages(self, includes):
         for package_path in self.resolver.packages:
            mf = {}
@@ -217,9 +253,19 @@ class SPLGraph(object):
         for name, sp in sps.items():
             params[name] = sp.spl_json()
 
-    def getLastOperator(self):
-        return self.operators[len(self.operators) -1]      
-        
+    def _add_checkpoint(self, _graph):
+
+        if self.topology.checkpoint_period is None:
+            pass
+        else:            
+            unit = "MICROSECONDS"
+
+            _graph["config"]["checkpoint"] = {}
+            _graph["config"]["checkpoint"]["mode"] = "periodic"
+            _graph["config"]["checkpoint"]["period"] = self.topology.checkpoint_period * 1000 * 1000 # Seconds to microseconds
+            _graph["config"]["checkpoint"]["unit"] = unit
+
+
 class _SPLInvocation(object):
 
     def __init__(self, index, kind, function, name, params, graph, view_configs = None, sl=None, stateful = False):
@@ -239,6 +285,8 @@ class _SPLInvocation(object):
         self._placement = {}
         self._start_op = False
         self.config = {}
+        # Arbitrary JSON for operator
+        self._op_def = {}
 
         if view_configs is None:
             self.view_configs = []
@@ -262,7 +310,11 @@ class _SPLInvocation(object):
         return oport
 
     def setParameters(self, params):
+        import streamsx.spl.op
         for param in params:
+            if params[param] is None:
+                # map Python None to SPL null
+                params[param] = streamsx.spl.op.Expression.expression("null")
             self.params[param] = params[param]
 
     def appendParameters(self, params):
@@ -279,22 +331,22 @@ class _SPLInvocation(object):
     def addViewConfig(self, view_configs):
         self.view_configs.append(view_configs)
 
-    def addInputPort(self, name=None, outputPort=None, window_config=None):
-        if name is None:
-            name = self.name + "_IN"+ str(len(self.inputPorts))
+    def addInputPort(self, outputPort=None, window_config=None, alias=None):
         iPortSchema = CommonSchema.Python    
         if not outputPort is None :
             iPortSchema = outputPort.schema        
-        iport = IPort(name, self, len(self.inputPorts),iPortSchema, window_config)
+        iport = IPort(self, len(self.inputPorts),iPortSchema, window_config)
         self.inputPorts.append(iport)
 
         if not outputPort is None:
             iport.connect(outputPort)
+        if alias:
+            iport._alias = alias
         return iport
 
 
     def generateSPLOperator(self):
-        _op = {}
+        _op = dict(self._op_def)
         _op["name"] = self.name
         if self.category:
             _op["category"] = self.category
@@ -411,19 +463,11 @@ class _SPLInvocation(object):
         if isinstance(self, Marker):
             return
 
-        colocate_id = self._placement.get('explicitColocate')
-        if not colocate_id:
-            colocate_id = '__spl_' + why + '_' + str(self.index)
-            self._placement['explicitColocate'] = colocate_id
-            self._remap_colocate_tag(colocate_id, colocate_id)
+        if 'colocateTags' not in self._placement:
+            self._placement['colocateTags'] = []
 
-        for op in others:
-            tag = op._placement.get('explicitColocate')
-            if tag:
-                if tag != colocate_id:
-                    self._remap_colocate_tag(colocate_id, tag)
-            else:
-                op._placement['explicitColocate'] = colocate_id
+        colocate_tag = '__spl_' + why + '$' + str(self.index)
+        self._placement['colocateTags'].append(colocate_tag)
 
     def _layout(self, kind=None, hidden=None, name=None, orig_name=None):
         if kind:
@@ -459,9 +503,14 @@ class _SPLInvocation(object):
         for port in self.outputPorts:
             print(port.name)
 
+# Input ports don't have a name in SPL but the code generation
+# keys ports by their name so we create a unique internal identifier
+# for the name.
+
 class IPort(object):
-    def __init__(self, name, operator, index, schema, window_config):
-        self.name = name
+    def __init__(self, operator, index, schema, window_config):
+        self.name = operator.graph._unique_id('$__spl_ip')
+        self._alias = None
         self.operator = operator
         self.index = index
         self.schema = schema
@@ -478,6 +527,8 @@ class IPort(object):
     def getSPLInputPort(self):
         _iport = {}
         _iport["name"] = self.name
+        if self._alias:
+            _iport['alias'] = self._alias
         _iport["connections"] = [port.name for port in self.outputPorts]
         _iport["type"] = self.schema.schema()
         if self.window_config is not None:
@@ -512,7 +563,7 @@ class OPort(object):
         _oport["routing"] = self.routing
 
         if not self.width is None:
-            _oport["width"] = int(self.width)
+            _oport['width'] = _as_spl_json(self.width, int)
         if not self.partitioned is None:
             _oport["partitioned"] = self.partitioned
         if self.partitioned_keys is not None:
@@ -525,6 +576,7 @@ class Marker(_SPLInvocation):
     def __init__(self, index, kind, name, params, graph):
         self.index = index
         self.kind = kind
+        self.model = 'virtual'
         self.name = name
         self.params = {}
         self.setParameters(params)
@@ -542,7 +594,7 @@ class Marker(_SPLInvocation):
         _op["partitioned"] = False
 
         _op["marker"] = True
-        _op["model"] = "virtual"
+        _op["model"] = self.model
         _op["language"] = "marker"
 
         _outputs = []

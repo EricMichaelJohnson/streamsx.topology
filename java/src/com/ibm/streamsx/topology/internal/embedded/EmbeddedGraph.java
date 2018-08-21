@@ -120,6 +120,8 @@ public class EmbeddedGraph {
     }
     
     public OperatorGraph declareGraph() throws Exception {
+        assert graphDecl == null;
+        
         graphDecl = OperatorGraphFactory.newGraph();
         
         declareOps();
@@ -164,7 +166,8 @@ public class EmbeddedGraph {
         
         String opClassName = jstring(json, KIND_CLASS);
         if (opClassName == null) {
-            opClassName = requireNonNull(jstring(kind2Class, jstring(json, OpProperties.KIND)));
+            opClassName = requireNonNull(
+                    jstring(kind2Class, op.kind()), op.kind());
         }
         Class<? extends Operator> opClass = (Class<? extends Operator>) Class.forName(opClassName);
         OperatorInvocation<? extends Operator> opDecl = graphDecl.addOperator(opClass);
@@ -431,12 +434,14 @@ public class EmbeddedGraph {
         @SuppressWarnings("unchecked")
         Map<String,Object> spValues =
             (Map<String, Object>) config.get(ContextProperties.SUBMISSION_PARAMS);
-        for (String spName : spValues.keySet()) {
-            if (allsp.containsKey(spName)) {
-                Object val = spValues.get(spName);
-                if (val != null)
-                    val = val.toString();
-                allsp.put(spName, (String)val);
+        if (spValues != null) {
+            for (String spName : spValues.keySet()) {
+                if (allsp.containsKey(spName)) {
+                    Object val = spValues.get(spName);
+                    if (val != null)
+                        val = val.toString();
+                    allsp.put(spName, (String)val);
+                }
             }
         }
         

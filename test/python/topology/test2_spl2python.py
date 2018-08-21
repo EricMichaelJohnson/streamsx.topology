@@ -5,8 +5,6 @@ import sys
 import itertools
 import threading
 
-import test_vers
-
 from streamsx.topology.topology import *
 from streamsx.topology.tester import Tester
 from streamsx.topology.schema import CommonSchema as cs
@@ -27,10 +25,11 @@ schemas = [
      'tuple<uint64 seq, rstring rs, float64 f64>',
      cs.Json, cs.String]
 
-@unittest.skipIf(not test_vers.tester_supported() , "tester not supported")
 class TestSPL2Python(unittest.TestCase):
     """ Test invocations handling of SPL schemas in Python ops.
     """
+    _multiprocess_can_split_ = True
+
     # Fake out subTest
     if sys.version_info.major == 2:
         def subTest(self, **args): return threading.Lock()
@@ -111,12 +110,30 @@ class TestSPL2Python(unittest.TestCase):
                 tester.tuple_count(b, 100)
                 tester.test(self.test_ctxtype, self.test_config)
 
-@unittest.skipIf(not test_vers.tester_supported() , "tester not supported")
+    def test_map_opt(self):
+        """Test optional type value and no value are passed correctly
+        """
+        Tester.require_streams_version(self, '4.3')
+        topo = Topology('test_map_opt')
+        schema='tuple<optional<uint64> i>'
+        b = op.Source(topo, "spl.utility::Beacon", schema,
+            params = {'iterations':3})
+        b.i = b.output('IterationCount() % 2ul == 0ul ?' +
+           'IterationCount() : (optional<uint64>) null')
+        s = b.stream
+        f = s.map(lambda tuple :
+            (1,) if tuple['i'] == None
+            else (None,) if tuple['i'] == 2
+            else (tuple['i'],), schema=schema)
+        tester = Tester(topo)
+        tester.contents(s, [{'i':0}, {'i':None}, {'i':2}])
+        tester.contents(f, [{'i':0}, {'i':1}, {'i':None}])
+        tester.test(self.test_ctxtype, self.test_config)
+
 class TestDistributedSPL(TestSPL2Python):
     def setUp(self):
         Tester.setup_distributed(self)
 
-@unittest.skipIf(not test_vers.tester_supported() , "tester not supported")
 class TestBluemixSPL(TestSPL2Python):
     def setUp(self):
         Tester.setup_streaming_analytics(self, force_remote_build=True)

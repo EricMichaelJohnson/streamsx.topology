@@ -1,6 +1,6 @@
 # coding=utf-8
 # Licensed Materials - Property of IBM
-# Copyright IBM Corp. 2016
+# Copyright IBM Corp. 2016,2018
 from __future__ import print_function
 import unittest
 import sys
@@ -8,14 +8,15 @@ import itertools
 from enum import IntEnum
 import datetime
 import decimal
-
-import test_vers
+import os
 
 from streamsx.topology.schema import StreamSchema
 from streamsx.topology.topology import *
 from streamsx.topology.tester import Tester
 import streamsx.topology.context
 import streamsx.spl.op as op
+import streamsx.spl.toolkit
+import streamsx.spl.types
 from streamsx.spl.types import Timestamp
 
 def ts_check(tuple_):
@@ -33,10 +34,11 @@ class TestParseOption(IntEnum):
     fast = 2
     
 
-@unittest.skipIf(not test_vers.tester_supported() , "tester not supported")
 class TestSPL(unittest.TestCase):
     """ Test invocations of SPL operators from Python topology.
     """
+    _multiprocess_can_split_ = True
+
     def setUp(self):
         Tester.setup_standalone(self)
 
@@ -79,12 +81,58 @@ class TestSPL(unittest.TestCase):
         tester.contents(s, [0, 4, 8, 12, 16, 20, 24])
         tester.test(self.test_ctxtype, self.test_config)
 
+    def test_map_attr_opt(self):
+        """Test a Source and a Map operator with optional types.
+           Including with operator parameters and output clauses.
+        """
+        Tester.require_streams_version(self, '4.3')
+        topo = Topology('test_map_attr_opt')
+        this_dir = os.path.dirname(os.path.realpath(__file__))
+        spl_dir = os.path.join(os.path.dirname(os.path.dirname(this_dir)), 'spl')
+        tk_dir = os.path.join(spl_dir, 'testtkopt')
+        streamsx.spl.toolkit.add_toolkit(topo, tk_dir)
+        schema = 'tuple<' \
+            'rstring r, ' \
+            'optional<rstring> orv, ' \
+            'optional<rstring> ornv, ' \
+            'int32 i32, ' \
+            'optional<int32> oi32v, ' \
+            'optional<int32> oi32nv>'
+        s = op.Source(topo, "testgen::TypeLiteralTester", schema, params = {
+            'r': 'a string',
+            'orv': 'optional string',
+            'ornv': None,
+            'i32': 123,
+            'oi32v': 456,
+            'oi32nv': streamsx.spl.types.null()})
+        f = op.Map('spl.relational::Functor', s.stream, schema = schema)
+        f.orv = f.output("null")
+        f.ornv = f.output('"string value"')
+        f.oi32v = f.output(streamsx.spl.types.null())
+        f.oi32nv = f.output('789')
+        tester = Tester(topo)
+        tester.contents(s.stream, [{
+            'r': 'a string',
+            'orv': 'optional string',
+            'ornv': None,
+            'i32': 123,
+            'oi32v': 456,
+            'oi32nv': None}])
+        tester.contents(f.stream, [{
+            'r': 'a string',
+            'orv': None,
+            'ornv': 'string value',
+            'i32': 123,
+            'oi32v': None,
+            'oi32nv': 789}])
+        tester.test(self.test_ctxtype, self.test_config)
+
     def test_stream_alias(self):
         """
         test a stream alias to ensure the SPL expression
         is consistent with hand-coded SPL expression.
         """
-        topo = Topology('test_SPLBeaconFilter')
+        topo = Topology('test_stream_alias')
         s = op.Source(topo, "spl.utility::Beacon",
             'tuple<uint64 seq>',
             params = {'period': 0.02, 'iterations':27}, name='SomeName')
@@ -172,12 +220,10 @@ class TestSPL(unittest.TestCase):
         tester.contents(ts, [{'a':1,'b':'ABC'},{'a':2,'b':'DEF'}])
         tester.test(self.test_ctxtype, self.test_config)
 
-@unittest.skipIf(not test_vers.tester_supported() , "tester not supported")
 class TestDistributedSPL(TestSPL):
     def setUp(self):
         Tester.setup_distributed(self)
 
-@unittest.skipIf(not test_vers.tester_supported() , "tester not supported")
 class TestBluemixSPL(TestSPL):
     def setUp(self):
         Tester.setup_streaming_analytics(self, force_remote_build=True)
@@ -209,10 +255,11 @@ GOOD_DATA = {
 }
 
 
-@unittest.skipIf(not test_vers.tester_supported() , "tester not supported")
 class TestConversion(unittest.TestCase):
     """ Test conversions of Python values to SPL attributes/types.
     """
+    _multiprocess_can_split_ = True
+
     def setUp(self):
         Tester.setup_standalone(self)
 
@@ -263,3 +310,25 @@ class TestConversion(unittest.TestCase):
                 tester.tuple_count(c, len(data))
                 tester.contents(c, expected)
                 tester.test(self.test_ctxtype, self.test_config)
+
+import shutil
+import uuid
+import subprocess
+@unittest.skipIf('STREAMS_INSTALL' not in os.environ, 'STREAMS_INSTALL not set')
+class TestMainComposite(unittest.TestCase):
+    def test_main_composite(self):
+        si = os.environ['STREAMS_INSTALL']
+        tkl = 'tkl_mc_' + str(uuid.uuid4().hex)
+        this_dir = os.path.dirname(os.path.realpath(__file__))
+        shutil.copytree(os.path.join(this_dir, 'spl_mc'), tkl)
+        ri = subprocess.call([os.path.join(si, 'bin', 'spl-make-toolkit'), '-i', tkl])
+        self.assertEqual(0, ri)
+        r = op.main_composite(kind='app::MyMain', toolkits=[tkl])
+        self.assertIsInstance(r, tuple)
+        self.assertIsInstance(r[0], Topology)
+        self.assertIsInstance(r[1], op.Invoke)
+        rc = streamsx.topology.context.submit('BUNDLE', r[0])
+        self.assertEqual(0, rc['return_code'])
+        shutil.rmtree(tkl)
+        os.remove(rc['bundlePath'])
+        os.remove(rc['jobConfigPath'])

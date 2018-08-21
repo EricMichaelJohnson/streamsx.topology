@@ -7,8 +7,6 @@ import itertools
 import time
 import os
 
-import test_vers
-
 from streamsx.topology.topology import *
 from streamsx.topology.tester import Tester
 from streamsx.topology import schema
@@ -16,8 +14,9 @@ import streamsx.topology.context
 import streamsx.spl.op as op
 
 
-@unittest.skipIf(not test_vers.tester_supported() , "tester not supported")
 class TestPending(unittest.TestCase):
+    _multiprocess_can_split_ = True
+
     """ Test pending connections.
     """
     def setUp(self):
@@ -120,7 +119,6 @@ class TestPending(unittest.TestCase):
         tester.contents(result, expected)
         tester.test(self.test_ctxtype, self.test_config)
 
-@unittest.skipIf(not test_vers.tester_supported() , "tester not supported")
 class TestPendingCloud(TestPending):
     def setUp(self):
         Tester.setup_streaming_analytics(self, force_remote_build=True)

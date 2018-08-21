@@ -13,21 +13,23 @@ from streamsx.topology.tester import Tester
 from streamsx import rest
 from streamsx.rest_primitives import _IAMConstants
 
-import test_vers
-
-@unittest.skipIf(not test_vers.tester_supported() , "Tester not supported")
 class TestJobConfig(unittest.TestCase):
+  _multiprocess_can_split_ = True
+
   def setUp(self):
       Tester.setup_streaming_analytics(self, force_remote_build=True)
       sc = rest.StreamingAnalyticsConnection()
 
-  # Known failure. Submitting a jobconfig during a remote build submission is not supported.
   def test_UnicodeJobName(self):
      """ Test unicode topo names
      """
      job_name = '你好世界'
      topo = Topology()
      jc = JobConfig(job_name=job_name)
+
+     # When tracing is info some extra code is invoked
+     # to trace all Python packages. Ensure it is exercised.
+     jc.tracing = 'info'
 
      hw = topo.source(["Hello", "Tester"])
      tester = Tester(topo)
@@ -256,6 +258,7 @@ class TestOverlays(unittest.TestCase):
         jc.submission_parameters['two'] = 2
         self._check_matching(jc)
 
+    @unittest.skipUnless('STREAMS_INSTALL' in os.environ, "requires STREAMS_INSTALL")
     def test_from_topology(self):
         topo = Topology('SabTest', namespace='mynamespace')
         s = topo.source([1,2])

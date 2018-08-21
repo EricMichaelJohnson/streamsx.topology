@@ -4,8 +4,6 @@ import unittest
 import sys
 import itertools
 
-import test_vers
-
 from streamsx.topology.topology import *
 from streamsx.topology.tester import Tester
 from streamsx.topology import schema
@@ -18,16 +16,24 @@ import streamsx.types
 import uuid
 
 
-@unittest.skipIf(not test_vers.tester_supported() , "tester not supported")
 class TestPubSub(unittest.TestCase):
     """ Test publish/subscribe
     """
+    _multiprocess_can_split_ = True
+
     def setUp(self):
         Tester.setup_distributed(self)
 
     def _check_topics(self):
         ins = self.tester.streams_connection.get_instance(self.tester.submission_result['instanceId'])
-        topics = ins.get_published_topics()
+        # topics are created dynamically so give some time
+        # for them to be created
+        for _ in range(10):
+            topics = ins.get_published_topics()
+            if topics:
+                break
+            time.sleep(2)
+
         # Don't assume this is the only app running so
         # other topics may exist
         sts = 0
@@ -133,7 +139,6 @@ class TestPubSub(unittest.TestCase):
         self.tester.local_check = self._check_buffer
         self.tester.test(self.test_ctxtype, self.test_config)
 
-@unittest.skipIf(not test_vers.tester_supported() , "tester not supported")
 class TestBluemixPubSub(TestPubSub):
     def setUp(self):
         Tester.setup_streaming_analytics(self, force_remote_build=True)

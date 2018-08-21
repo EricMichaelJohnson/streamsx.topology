@@ -6,9 +6,13 @@ package com.ibm.streamsx.topology.builder;
 
 import static com.ibm.streamsx.topology.builder.BVirtualMarker.END_LOW_LATENCY;
 import static com.ibm.streamsx.topology.builder.BVirtualMarker.LOW_LATENCY;
+import static com.ibm.streamsx.topology.builder.BVirtualMarker.UNION;
 import static com.ibm.streamsx.topology.generator.operator.OpProperties.KIND_CLASS;
+import static com.ibm.streamsx.topology.generator.operator.OpProperties.LANGUAGE;
 import static com.ibm.streamsx.topology.generator.operator.OpProperties.LANGUAGE_JAVA;
 import static com.ibm.streamsx.topology.generator.operator.OpProperties.LANGUAGE_SPL;
+import static com.ibm.streamsx.topology.generator.operator.OpProperties.MODEL;
+import static com.ibm.streamsx.topology.generator.operator.OpProperties.MODEL_FUNCTIONAL;
 import static com.ibm.streamsx.topology.generator.operator.OpProperties.MODEL_SPL;
 import static com.ibm.streamsx.topology.generator.operator.OpProperties.MODEL_VIRTUAL;
 import static com.ibm.streamsx.topology.internal.core.JavaFunctionalOps.NS_COLON;
@@ -25,6 +29,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
@@ -37,8 +42,8 @@ import com.ibm.streamsx.topology.generator.spl.GraphUtilities.VisitController;
 import com.ibm.streamsx.topology.internal.core.JavaFunctionalOps;
 import com.ibm.streamsx.topology.internal.core.SubmissionParameterFactory;
 import com.ibm.streamsx.topology.internal.functional.SubmissionParameter;
-import com.ibm.streamsx.topology.internal.streams.Util;
 import com.ibm.streamsx.topology.internal.messages.Messages;
+import com.ibm.streamsx.topology.internal.streams.Util;
 
 /**
  * Low-level graph builder. GraphBuilder provides a layer on top of
@@ -76,10 +81,13 @@ public class GraphBuilder extends BJSONObject {
         _json().add("parameters", params);
 
         getConfig().addProperty(CFG_STREAMS_VERSION, Util.productVersion());
-        ;
+        // Indicate how the graph was generated.
+        getConfig().addProperty(MODEL, MODEL_FUNCTIONAL);
+        getConfig().addProperty(LANGUAGE, LANGUAGE_JAVA);
     }
    
    private final Map<String,Integer> usedNames = new HashMap<>();
+   private final AtomicInteger idGen = new AtomicInteger();
    
     public BOperatorInvocation addOperator(String name, String kind, Map<String, ? extends Object> params) {
 
@@ -95,14 +103,7 @@ public class GraphBuilder extends BJSONObject {
         if (name.isEmpty())
             return;
 
-        String uniqueName = userSuppliedName(name);
-
-        if (!uniqueName.equals(name)) {
-            JsonObject nameMap = new JsonObject();
-            nameMap.addProperty(uniqueName, name);
-            op.layout().add("names", nameMap);
-        }
-        op._json().addProperty("name", uniqueName);
+        op.rename(name);
     }
    
    String userSuppliedName(String name) {
@@ -115,6 +116,14 @@ public class GraphBuilder extends BJSONObject {
        }
        return name;
    }
+   
+   /**
+    * Generate a unique (within the graph) identifer internal to
+    * graph generation.
+    */
+   public String uniqueId(String prefix) {
+       return prefix + Integer.toString(idGen.getAndIncrement());
+   }
     
     public BOutput lowLatency(BOutput parent){
         BOutput lowLatencyOutput = addPassThroughMarker(parent, BVirtualMarker.LOW_LATENCY, true);
@@ -126,12 +135,7 @@ public class GraphBuilder extends BJSONObject {
     }
 
     public boolean isInLowLatencyRegion(BOutput output) {
-        BOperator op;
-        if (output instanceof BUnionOutput)
-            op = ((BUnionOutput) output).operator();
-        else
-            op = ((BOutputPort) output).operator();
-        return isInLowLatencyRegion(op);
+        return isInLowLatencyRegion(output.operator());
     }
     
     public boolean isInLowLatencyRegion(BOperator... operators) {
@@ -173,8 +177,24 @@ public class GraphBuilder extends BJSONObject {
     }
 
     public BOutput addUnion(Set<BOutput> outputs) {
-        BOperator op = addVirtualMarkerOperator(BVirtualMarker.UNION);
-        return new BUnionOutput(op, outputs);
+        
+        assert outputs.size() >= 2;
+        BOutput[] outs = new BOutput[outputs.size()];
+        outputs.toArray(outs);
+        
+        BOperatorInvocation op = addOperator(UNION.name(), UNION.kind(), null);
+        op._json().addProperty("marker", true);
+        op._json().addProperty(KIND_CLASS, JavaFunctionalOps.PASS_CLASS);
+        op.setModel(MODEL_VIRTUAL, LANGUAGE_JAVA);
+
+        // Create the input port that consumes the output
+        final BInputPort input = op.inputFrom(outs[0], null);
+        
+        for (int i = 1; i < outs.length; i++)
+            op.inputFrom(outs[i], input);
+
+        // Create the output port.
+        return op.addOutput(input._schema());
     }
 
     /**
@@ -229,12 +249,6 @@ public class GraphBuilder extends BJSONObject {
         BInputPort input = op.inputFrom(output, null);
         // Create the output port.
         return op.addOutput(input._schema());
-    }
-
-    public BOperator addVirtualMarkerOperator(BVirtualMarker kind) {
-        final BMarkerOperator op = new BMarkerOperator(this, kind);
-        ops.add(op);
-        return op;
     }
 
     public BOperatorInvocation addSPLOperator(String name, String kind,

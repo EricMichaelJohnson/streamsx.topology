@@ -6,10 +6,9 @@ from streamsx import rest
 import os
 import fnmatch
 
-import test_vers
-
-@unittest.skipIf(not test_vers.tester_supported() , "Tester not supported")
 class TestSubmissionResult(unittest.TestCase):
+    _multiprocess_can_split_ = True
+
     def setUp(self):
         Tester.setup_distributed(self)
         self.username = os.getenv("STREAMS_USERNAME", "streamsadmin")
@@ -103,6 +102,8 @@ class TestSubmissionResultStreamingAnalytics(TestSubmissionResult):
 
         sr = tester.submission_result
         self.assertIn('submitMetrics', sr)
+        self.assertIn('console.application.url', sr)
+        self.assertIn('console.application.job.url', sr)
         m = sr['submitMetrics']
         self.assertIn('buildArchiveSize', m)
         self.assertIn('buildArchiveUploadTime_ms', m)

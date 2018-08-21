@@ -7,8 +7,6 @@ import tempfile
 import unittest
 import time
 
-import test_vers
-
 class EE(object):
     def __init__(self, td):
         self.td = td
@@ -38,7 +36,6 @@ class EEFlatMap(EE):
     def __call__(self, t):
         return [t]
 
-@unittest.skipIf(not test_vers.tester_supported() , "Tester not supported")
 class TestEnterExit(unittest.TestCase):
 
     def setUp(self):
@@ -109,6 +106,7 @@ def EEMSFunc(x):
     return None
 
 class TestSuppressMetricDistributed(unittest.TestCase):
+    _multiprocess_can_split_ = True
     def setUp(self):
         Tester.setup_distributed(self)
 

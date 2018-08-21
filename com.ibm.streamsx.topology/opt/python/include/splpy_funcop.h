@@ -21,6 +21,7 @@
 
 #include <SPL/Runtime/Operator/ParameterValue.h>
 
+
 namespace streamsx {
   namespace topology {
 
@@ -28,20 +29,14 @@ class SplpyFuncOp : public SplpyOp {
   public:
 
       SplpyFuncOp(SPL::Operator * op, const std::string & wrapfn) :
-         SplpyOp(op, "/opt/python/packages/streamsx/topology")
+        SplpyOp(op, "/opt/python/packages/streamsx/topology")
       {
          setSubmissionParameters();
          addAppPythonPackages();
          loadAndWrapCallable(wrapfn);
       }
-
-      ~SplpyFuncOp() {
-      }
-
-
-
+      
   private:
-
       int hasParam(const char *name) {
           return op()->getParameterNames().count(name);
       }
@@ -99,9 +94,7 @@ class SplpyFuncOp : public SplpyOp {
              appCallable = pyUnicode_FromUTF8(param("pyCallable").c_str());
              Py_DECREF(appClass);
 
-#if __SPLPY_EC_MODULE_OK
              setopc();
-#endif
           }
 
           PyObject *extraArg = NULL;
@@ -114,7 +107,10 @@ class SplpyFuncOp : public SplpyOp {
                "streamsx.topology.runtime", wrapfn, appCallable, extraArg));
       }
 
-
+      virtual bool isStateful() {
+        return static_cast<SPL::boolean>(op()->getParameterValues("pyStateful")[0]->getValue());
+      }
+ 
       /*
        *  Add any packages in the application directory
        *  to the Python path. The application directory
@@ -129,8 +125,9 @@ class SplpyFuncOp : public SplpyOp {
             streamsx::topology::pyUnicode_FromUTF8(param("toolkitDir"));
 
           SplpyGeneral::callVoidFunction(
-              "streamsx.topology.runtime", "setupOperator", tkDir, NULL);
+              "streamsx._streams._runtime", "_setup_operator", tkDir, NULL);
       }
+
 };
 
 }}

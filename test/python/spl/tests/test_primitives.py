@@ -14,14 +14,19 @@ import streamsx.spl.op as op
 import streamsx.spl.toolkit
 import streamsx.scripts.extract
 
+import spl_tests_utils as stu
+
 class TestPrimitives(unittest.TestCase):
     """ 
     Test @spl.primitive_operator decorated operators
     """
+
+    _multiprocess_can_split_ = True
+
     @classmethod
     def setUpClass(cls):
         """Extract Python operators in toolkit"""
-        streamsx.scripts.extract.main(['-i', '../testtkpy', '--make-toolkit'])
+        stu._extract_tk('testtkpy')
 
     def setUp(self):
         Tester.setup_distributed(self)
@@ -49,7 +54,7 @@ class TestPrimitives(unittest.TestCase):
     def test_noports(self):
         """Operator with no inputs or outputs"""
         topo = Topology()
-        streamsx.spl.toolkit.add_toolkit(topo, '../testtkpy')
+        streamsx.spl.toolkit.add_toolkit(topo, stu._tk_dir('testtkpy'))
         bop = op.Invoke(topo, "com.ibm.streamsx.topology.pytest.pyprimitives::NoPorts", params = {'mn': 'mymetric', 'iv':89})
 
         self.tester = Tester(topo)
@@ -81,7 +86,7 @@ class TestPrimitives(unittest.TestCase):
     def test_single_input_port(self):
         """Operator with one input port"""
         topo = Topology()
-        streamsx.spl.toolkit.add_toolkit(topo, '../testtkpy')
+        streamsx.spl.toolkit.add_toolkit(topo, stu._tk_dir('testtkpy'))
         s = topo.source([1043])
         s = s.map(lambda x : (x,), schema='tuple<uint64 v>')
         bop = op.Sink("com.ibm.streamsx.topology.pytest.pyprimitives::SingleInputPort", s, name="SIP_OP")
@@ -130,7 +135,7 @@ class TestPrimitives(unittest.TestCase):
     def test_multi_input_ports(self):
         """Operator with three input ports"""
         topo = Topology()
-        streamsx.spl.toolkit.add_toolkit(topo, '../testtkpy')
+        streamsx.spl.toolkit.add_toolkit(topo, stu._tk_dir('testtkpy'))
         s0 = topo.source([9054]).map(lambda x : (x,), schema='tuple<uint64 v>')
         s1 = topo.source([345]).map(lambda x : (x,), schema='tuple<int64 v>')
         s2 = topo.source([-953]).map(lambda x : (x,), schema='tuple<int32 v>')
@@ -143,17 +148,20 @@ class TestPrimitives(unittest.TestCase):
 # With output ports it's easier to test thus can use standalone.
 #
 class TestPrimitivesOutputs(unittest.TestCase):
+    _multiprocess_can_split_ = True
+
     @classmethod
     def setUpClass(cls):
         """Extract Python operators in toolkit"""
-        streamsx.scripts.extract.main(['-i', '../testtkpy', '--make-toolkit'])
+        stu._extract_tk('testtkpy')
+
     def setUp(self):
         Tester.setup_standalone(self)
 
     def test_single_output_port(self):
         """Operator with single output port."""
         topo = Topology()
-        streamsx.spl.toolkit.add_toolkit(topo, '../testtkpy')
+        streamsx.spl.toolkit.add_toolkit(topo, stu._tk_dir('testtkpy'))
 
         s = topo.source([9237, -24])
         s = s.map(lambda x : (x,), schema='tuple<int64 v>')
@@ -170,7 +178,7 @@ class TestPrimitivesOutputs(unittest.TestCase):
     def test_multi_output_ports(self):
         """Operator with multiple output port."""
         topo = Topology()
-        streamsx.spl.toolkit.add_toolkit(topo, '../testtkpy')
+        streamsx.spl.toolkit.add_toolkit(topo, stu._tk_dir('testtkpy'))
 
         s = topo.source([9237, -24])
         s = s.map(lambda x : (x,), schema='tuple<int64 v>')
@@ -189,7 +197,7 @@ class TestPrimitivesOutputs(unittest.TestCase):
     def test_dict_output_ports(self):
         """Operator with multiple output port submitting dict objects."""
         topo = Topology()
-        streamsx.spl.toolkit.add_toolkit(topo, '../testtkpy')
+        streamsx.spl.toolkit.add_toolkit(topo, stu._tk_dir('testtkpy'))
 
         s = topo.source([9237, -24])
         s = s.map(lambda x : (x,x*2,x+4), schema='tuple<int64 d, int64 e, int64 f>')
@@ -208,7 +216,7 @@ class TestPrimitivesOutputs(unittest.TestCase):
     def test_input_by_position(self):
         """Operator with input by position"""
         topo = Topology()
-        streamsx.spl.toolkit.add_toolkit(topo, '../testtkpy')
+        streamsx.spl.toolkit.add_toolkit(topo, stu._tk_dir('testtkpy'))
 
         s = topo.source([3642, -393])
         s = s.map(lambda x : (x,x*2,x+4), schema='tuple<int64 d, int64 e, int64 f>')
@@ -226,7 +234,7 @@ class TestPrimitivesOutputs(unittest.TestCase):
         """Operator with single output port and no inputs."""
         count = 106
         topo = Topology()
-        streamsx.spl.toolkit.add_toolkit(topo, '../testtkpy')
+        streamsx.spl.toolkit.add_toolkit(topo, stu._tk_dir('testtkpy'))
 
         bop = op.Source(topo, "com.ibm.streamsx.topology.pytest.pyprimitives::OutputOnly", schema='tuple<int64 c>', params={'count':count})
 
