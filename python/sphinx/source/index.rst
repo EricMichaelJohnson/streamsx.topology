@@ -29,6 +29,7 @@ See :py:mod:`~streamsx.topology`
 
    streamsx.topology
    streamsx.topology.topology
+   streamsx.topology.consistent
    streamsx.topology.context
    streamsx.topology.schema
    streamsx.topology.tester
@@ -82,6 +83,7 @@ The `streamsx` package provides a number of command line scripts.
 .. toctree::
 
    scripts/runner.rst
+   scripts/service.rst
    scripts/extract.rst
 
 ************

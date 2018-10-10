@@ -288,10 +288,11 @@ class Tester(object):
         if not 'STREAMS_INSTALL' in os.environ:
             raise unittest.SkipTest("Skipped due to no local IBM Streams install")
 
-        if not 'STREAMS_INSTANCE_ID' in os.environ:
-            raise unittest.SkipTest("Skipped due to STREAMS_INSTANCE_ID environment variable not set")
-        if not 'STREAMS_DOMAIN_ID' in os.environ:
-            raise unittest.SkipTest("Skipped due to STREAMS_DOMAIN_ID environment variable not set")
+        domain_instance_setup = 'STREAMS_INSTANCE_ID' in os.environ and 'STREAMS_DOMAIN_ID' in os.environ
+        rest_setup = 'STREAMS_REST_URL' in os.environ
+
+        if not domain_instance_setup and not rest_setup:
+            raise unittest.SkipTest("Skipped due missing environment variables")
 
         test.test_ctxtype = stc.ContextTypes.DISTRIBUTED
         test.test_config = {}
@@ -376,12 +377,11 @@ class Tester(object):
             Stream: stream
         """
         _logger.debug("Adding tuple count (%d) condition to stream %s.", count, stream)
+        name = stream.name + '_count'
         if exact:
-            name = "ExactCount" + str(len(self._conditions))
             cond = sttrt._TupleExactCount(count, name)
             cond._desc = "{0} stream expects tuple count equal to {1}.".format(stream.name, count)
         else:
-            name = "AtLeastCount" + str(len(self._conditions))
             cond = sttrt._TupleAtLeastCount(count, name)
             cond._desc = "'{0}' stream expects tuple count of at least {1}.".format(stream.name, count)
         return self.add_condition(stream, cond)
@@ -397,7 +397,7 @@ class Tester(object):
         Returns:
             Stream: stream
         """
-        name = "StreamContents" + str(len(self._conditions))
+        name = stream.name + '_contents'
         if ordered:
             cond = sttrt._StreamContents(expected, name)
             cond._desc = "'{0}' stream expects tuple ordered contents: {1}.".format(stream.name, expected)
@@ -405,6 +405,27 @@ class Tester(object):
             cond = sttrt._UnorderedStreamContents(expected, name)
             cond._desc = "'{0}' stream expects tuple unordered contents: {1}.".format(stream.name, expected)
         return self.add_condition(stream, cond)
+
+    def resets(self, minimum_resets=10):
+        """Create a condition that randomly resets consistent regions.
+        The condition becomes valid when each consistent region in the
+        application under test has been reset `minimum_resets` times
+        by the tester.
+
+
+        The resets are performed at arbitrary intervals scaled to the 
+        period of the region (if it is periodically triggered).
+
+        .. note::
+             A region is reset by initiating a request though the Job Control Plane. The reset is not driven by any injected failure, such as a PE restart.
+
+        Args:
+            minimum_resets(int): Minimum number of resets for each region.
+
+        .. versionadded:: 1.11
+        """
+        resetter = sttrt._Resetter(self.topology, minimum_resets=minimum_resets)
+        self.add_condition(None, resetter)
 
     def tuple_check(self, stream, checker):
         """Check each tuple on a stream.
@@ -454,8 +475,45 @@ class Tester(object):
             checker(callable): Callable that must evaluate to True for each tuple.
 
         """
-        name = "TupleCheck" + str(len(self._conditions))
+        name = stream.name + '_check'
         cond = sttrt._TupleCheck(checker, name)
+        self.topology.graph.add_dependency(checker)
+        return self.add_condition(stream, cond)
+
+    def eventual_result(self, stream, checker):
+        """Test a stream reaches a known result or state.
+
+        Creates a test condition that the tuples on a stream
+        eventually reach a known result or state. Each tuple
+        on `stream` results in a call to ``checker(tuple_)``.
+
+        The return from `checker` is handled as:
+            * ``None`` - The condition requires more tuples to become valid.
+            * `true value` - The condition has become valid.
+            * `false value` - The condition has failed. Once a condition has
+                failed it can never become valid.
+
+        Thus `checker` is typically stateful and allows ensuring that
+        condition becomes valid from a set of input tuples. For example
+        in a financial application the application under test may need
+        to achieve a final known balance, but due to timings of windows the
+        number of tuples required to set the final balance may be variable.
+
+        Once the condition becomes valid any false value,
+        except ``None``, returned by processing of subsequent
+        tuples will cause the condition to fail.
+
+        Returning ``None`` effectively never changes the state of the condition.
+
+        Args:
+            stream(Stream): Stream to be tested.
+            checker(callable): Callable that returns evaluates the state of the stream with result to the result.
+       
+        .. versionadded:: 1.11
+        """
+        name = stream.name + '_eventual'
+        cond = sttrt._EventualResult(checker, name)
+        self.topology.graph.add_dependency(checker)
         return self.add_condition(stream, cond)
 
     def local_check(self, callable):
@@ -584,10 +642,7 @@ class Tester(object):
         for ct in self._conditions.values():
             condition = ct[1]
             stream = ct[0]
-            cond_sink = stream.for_each(condition, name=condition.name)
-            cond_sink.colocate(stream)
-            cond_sink.category = 'Tester'
-            cond_sink._op()._layout(hidden=True)
+            condition._attach(stream)
 
         # Standalone uses --kill-after parameter.
         if self._run_for and stc.ContextTypes.STANDALONE != ctxtype:
@@ -612,7 +667,7 @@ class Tester(object):
         else:
             raise NotImplementedError("Tester context type not implemented:", ctxtype)
 
-        if self.result.get('conditions'):
+        if hasattr(self, 'result') and self.result.get('conditions'):
             for cn,cnr in self.result['conditions'].items():
                 c = self._conditions[cn][1]
                 cdesc = cn
@@ -686,6 +741,7 @@ class Tester(object):
             if self.local_check is not None:
                 self._local_thread.join()
         else:
+            _logger.error ("wait for healthy failed")
             self.result = cc._end(False, _ConditionChecker._UNHEALTHY)
 
         self.result['submission_result'] = self.submission_result
@@ -740,7 +796,9 @@ def _result_to_dict(passed, t):
     return result
 
 class _ConditionChecker(object):
-    _UNHEALTHY = (False, False, False, None)
+    # Return from _check_once
+    # (valid, fail, progress, condition_states)
+    _UNHEALTHY = (False, True, False, None)
 
     def __init__(self, tester, sc, sjr):
         self.tester = tester
@@ -751,8 +809,8 @@ class _ConditionChecker(object):
         self._sequences = {}
         for cn in tester._conditions:
             self._sequences[cn] = -1
-        self.delay = 0.5
-        self.timeout = 10.0
+        self.delay = 1.0 
+        self.timeout = 30.0
         self.waits = 0
         self.additional_checks = 2
 
@@ -761,18 +819,33 @@ class _ConditionChecker(object):
     # Wait for job to be healthy. Returns True
     # if the job became healthy, False if not.
     def _wait_for_healthy(self):
+        ok_pes = 0
         while (self.waits * self.delay) < self.timeout:
-            if self._check_job_health():
+            ok_ = self._check_job_health(start=True)
+            if ok_ is True:
                 self.waits = 0
                 return True
+            if ok_ is False: # actually failed
+                _logger.error ("wait for healthy actually failed")
+                return False
+
+            # ok_ is number of ok PEs
+            if ok_ <= ok_pes:
+                self.waits += 1
+            else:
+                # making progress so don't move towards
+                # the timeout
+                self.waits = 0
+                ok_pes = ok_
             time.sleep(self.delay)
-            self.waits += 1
-        self._check_job_health(verbose=True)
-        return False
+        else:
+            _logger.error ("timed out waiting for healthy")
+
+        return self._check_job_health(verbose=True)
 
     def _complete(self):
         while (self.waits * self.delay) < self.timeout:
-            check = self. __check_once()
+            check = self._check_once()
             if check[1]:
                 return self._end(False, check)
             if check[0]:
@@ -785,6 +858,9 @@ class _ConditionChecker(object):
             else:
                 self.waits += 1
             time.sleep(self.delay)
+        else:
+            _logger.error("timed out waiting for test to complete")
+
         return self._end(False, check)
 
     def _end(self, passed, check):
@@ -795,7 +871,7 @@ class _ConditionChecker(object):
         if self.job is not None:
             self.job.cancel(force=not result['passed'])
 
-    def __check_once(self):
+    def _check_once(self):
         if not self._check_job_health(verbose=True):
             return _ConditionChecker._UNHEALTHY
         cms = self._get_job_metrics()
@@ -840,24 +916,32 @@ class _ConditionChecker(object):
             else:
                 condition_states[cn] = 'Valid'
 
-        return (valid, fail, progress, condition_states)
+        return valid, fail, progress, condition_states
 
-    def _check_job_health(self, verbose=False):
+    def _check_job_health(self, start=False, verbose=False):
         self.job.refresh()
-        if self.job.health != 'healthy':
+        ok_ = self.job.health == 'healthy'
+        if not ok_:
             if verbose:
                 _logger.error("Job %s health:%s", self.job.name, self.job.health)
-            return False
+            if not start:
+                return False
+        ok_pes = 0
         for pe in self.job.get_pes():
-            if pe.launchCount != 1:
-                if verbose:
+            if pe.launchCount == 0:
+                continue # not a test failure, but not an ok_pe either
+            if pe.launchCount > 1:
+                if verbose or start:
                     _logger.error("PE %s launch count > 1: %s", pe.id, pe.launchCount)
                 return False
             if pe.health != 'healthy':
                 if verbose:
                     _logger.error("PE %s health: %s", pe.id, pe.health)
-                return False
-        return True
+                if not start:
+                    return False
+            else:
+                ok_pes += 1
+        return True if ok_ else ok_pes
 
     def _find_job(self):
         instance = self._sc.get_instance(id=self._instance_id)

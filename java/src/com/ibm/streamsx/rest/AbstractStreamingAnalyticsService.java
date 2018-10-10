@@ -18,11 +18,10 @@ import java.io.IOException;
 import java.io.UnsupportedEncodingException;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
-import java.util.Random;
+import java.util.concurrent.ThreadLocalRandom;
 
 import org.apache.http.HttpEntity;
 import org.apache.http.auth.AUTH;
-import org.apache.http.client.ClientProtocolException;
 import org.apache.http.client.methods.HttpGet;
 import org.apache.http.client.methods.HttpPost;
 import org.apache.http.entity.ContentType;
@@ -50,12 +49,9 @@ import com.ibm.streamsx.topology.internal.streams.Util;
  */
 abstract class AbstractStreamingAnalyticsService implements StreamingAnalyticsService {
 
-    final protected JsonObject credentials;
+    private final JsonObject credentials;
     final protected JsonObject service;
     private final String serviceName;
-
-    // Current value for the authorization header
-    protected String authorization;
 
     // Connection to Streams REST API
     AbstractStreamingAnalyticsConnection streamsConnection;
@@ -65,6 +61,10 @@ abstract class AbstractStreamingAnalyticsService implements StreamingAnalyticsSe
         this.credentials = credentials;
         this.service = service;
         this.serviceName = jstring(service, "name");
+    }
+    
+    final JsonObject credentials() {
+    	return credentials;
     }
     
     @Override
@@ -107,29 +107,20 @@ abstract class AbstractStreamingAnalyticsService implements StreamingAnalyticsSe
             throws IOException;
     /** Version-specific to submit a build. */
     protected abstract JsonObject submitBuild(CloseableHttpClient httpclient,
-            String authorization, File archive, String buildName) throws IOException;
+            File archive, String buildName) throws IOException;
     /** Version-specific to get build info. */
     protected abstract JsonObject getBuild(String buildId,
-            CloseableHttpClient httpclient,
-            String authorization) throws IOException;
+            CloseableHttpClient httpclient) throws IOException;
     /** Version-specific to submit build artifact as job. */
     protected abstract JsonObject submitBuildArtifact(CloseableHttpClient httpclient,
-            JsonObject deploy, String authorization, String submitUrl)
+            JsonObject deploy, String submitUrl)
             throws IOException;
     /** Version-specific to get build info that includes output. */
     protected abstract JsonObject getBuildOutput(String buildId, String outputId,
-            CloseableHttpClient httpclient,
-            String authorization) throws IOException;
+            CloseableHttpClient httpclient) throws IOException;
     /** Version-specific mechanism to get AbstractStreamsConnection. */
     abstract AbstractStreamingAnalyticsConnection createStreamsConnection()
             throws IOException;
-
-    /**
-     * Set the current authorization header contents.
-     */
-    protected void setAuthorization(String authorization) {
-        this.authorization = authorization;
-    }
 
     @Override
     public Result<Job, JsonObject> submitJob(File bundle, JsonObject jco) throws IOException {
@@ -196,18 +187,19 @@ abstract class AbstractStreamingAnalyticsService implements StreamingAnalyticsSe
             // Perform initial post of the archive
             TRACE.info("Streaming Analytics service (" + serviceName + "): submitting build " + buildName);
             final long startUploadTime = System.currentTimeMillis();
-            JsonObject build = submitBuild(httpclient, getAuthorization(), archive, buildName);
+            JsonObject buildSubmission = submitBuild(httpclient, archive, buildName);
             final long endUploadTime = System.currentTimeMillis();
             metrics.addProperty(SubmissionResultsKeys.SUBMIT_UPLOAD_TIME, (endUploadTime - startUploadTime));
             
-            String buildId = jstring(build, "id");
-            String outputId = jstring(build, "output_id");
+            String buildId = jstring(buildSubmission, "id");
+            String outputId = jstring(buildSubmission, "output_id");
 
             // Loop until built
             final long startBuildTime = endUploadTime;
             long lastCheckTime = endUploadTime;
-            String status = buildStatusGet(buildId, httpclient, getAuthorization());
-            while (!status.equals("built")) {
+            JsonObject buildStatus = getBuild(buildId, httpclient);  
+            String status = jstring(buildStatus, "status");
+            while (!"built".equals(status)) {
                 String mkey = SubmissionResultsKeys.buildStateMetricKey(status);
                 long now = System.currentTimeMillis();
                 long duration;
@@ -228,13 +220,14 @@ abstract class AbstractStreamingAnalyticsService implements StreamingAnalyticsSe
                     } catch (InterruptedException e) {
                         Thread.currentThread().interrupt();
                     }
-                    status = buildStatusGet(buildId, httpclient, getAuthorization());
+                    buildStatus = getBuild(buildId, httpclient); 
+                    status = jstring(buildStatus, "status");
                     continue;
                 } 
                 // The remaining possible states are 'failed', 'timeout', 'canceled', 'canceling', and 'unknown', none of which can lead to a state of 'built', so we throw an error.
                 else {
                     TRACE.severe("Streaming Analytics service (" + serviceName + "): The submitted archive " + archive.getName() + " failed to build with status " + status + ".");
-                    JsonObject output = getBuildOutput(buildId, outputId, httpclient, getAuthorization());
+                    JsonObject output = getBuildOutput(buildId, outputId, httpclient);
                     String strOutput = "";
                     if (output != null)
                         strOutput = prettyPrintOutput(output);
@@ -245,12 +238,10 @@ abstract class AbstractStreamingAnalyticsService implements StreamingAnalyticsSe
             metrics.addProperty(SubmissionResultsKeys.SUBMIT_TOTAL_BUILD_TIME, (endBuildTime - startBuildTime));
 
             // Now perform archive put
-            build = getBuild(buildId, httpclient, getAuthorization());
-
-            JsonArray artifacts = array(build, "artifacts");
+            JsonArray artifacts = array(buildStatus, "artifacts");
             if (artifacts == null || artifacts.size() == 0) {
                 throw new IllegalStateException("No artifacts associated with build "
-                        + jstring(build, "id"));
+                        + jstring(buildStatus, "id"));
             }
             // TODO: support multiple artifacts associated with a single build.
             JsonObject artifact = artifacts.get(0).getAsJsonObject();
@@ -258,8 +249,7 @@ abstract class AbstractStreamingAnalyticsService implements StreamingAnalyticsSe
 
             TRACE.info("Streaming Analytics service (" + serviceName + "): submitting job request.");
             final long startSubmitTime = System.currentTimeMillis();
-            JsonObject response = submitBuildArtifact(httpclient, jco,
-                    getAuthorization(), submitUrl);
+            JsonObject response = submitBuildArtifact(httpclient, jco, submitUrl);
             final long endSubmitTime = System.currentTimeMillis();
             metrics.addProperty(SubmissionResultsKeys.SUBMIT_JOB_TIME, (endSubmitTime - startSubmitTime));
             
@@ -297,32 +287,15 @@ abstract class AbstractStreamingAnalyticsService implements StreamingAnalyticsSe
         return sb.toString();
     }
 
-    /**
-     * Retrieves the status of the build.
-     * @param buildId
-     * @param httpclient
-     * @param authorization
-     * @return The status of the build associated with *buildId* as a String.
-     * @throws IOException 
-     * @throws ClientProtocolException 
-     */
-    private String buildStatusGet(String buildId, CloseableHttpClient httpclient,
-            String authorization) throws ClientProtocolException, IOException{
-        JsonObject build = getBuild(buildId, httpclient, authorization);   
-        if(build != null)
-            return jstring(build, "status");
-        else
-            return null;
-    }
+    private static final String HEXES = "0123456789ABCDEF";
+    private static final int HEXES_L = HEXES.length();
 
-    private String randomHex(int length){
-        char[] hexes = "0123456789ABCDEF".toCharArray();
-        Random r = new Random();
-        String name = "";
-        for(int i = 0; i < length; i++){
-            name += String.valueOf((hexes[r.nextInt(hexes.length)]));
+    private static String randomHex(final int length) {
+        char[] name = new char[length];
+        for (int i = 0; i < length; i++) {
+            name[i] = HEXES.charAt(ThreadLocalRandom.current().nextInt(HEXES_L));
         }
-        return name;
+        return new String(name);
     }
 
     public Instance getInstance() throws IOException {
