@@ -65,6 +65,7 @@ namespace streamsx {
 
 class SplpySetup {
   public:
+
     /*
      * Load embedded Python and execute the toolkit's
      * spl_setup.py script.
@@ -75,11 +76,19 @@ class SplpySetup {
         void * pydl = loadPythonLib();
         SplpySym::fixSymbols(pydl);
         startPython(pydl);
+        setupErrors(pydl);
         setupNone(pydl);
         setupMemoryViewCheck(pydl);
         runSplSetup(pydl, spl_setup_py_path);
         setupClasses();
         return pydl;
+    }
+    static void setupErrors(void * pydl) {
+        PyObject** ves = (PyObject**) dlsym(pydl, "PyExc_ValueError");
+        SplpyErrors::ValueError = *ves;
+
+        ves = (PyObject**) dlsym(pydl, "PyExc_StopIteration");
+        SplpyErrors::StopIteration = *ves;
     }
 
     /*

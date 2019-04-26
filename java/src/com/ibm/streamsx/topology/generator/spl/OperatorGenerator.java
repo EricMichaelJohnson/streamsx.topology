@@ -32,7 +32,12 @@ import static com.ibm.streamsx.topology.internal.gson.GsonUtilities.objectCreate
 import static com.ibm.streamsx.topology.internal.gson.GsonUtilities.stringArray;
 
 import java.io.IOException;
+import java.text.Collator;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashSet;
+import java.util.List;
+import java.util.Locale;
 import java.util.Map.Entry;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
@@ -64,6 +69,7 @@ class OperatorGenerator {
     String generate(JsonObject graphConfig, JsonObject op) throws IOException {
         JsonObject _op = op;
         StringBuilder sb = new StringBuilder();
+        genericAnnotations(_op, sb);
         noteAnnotations(_op, sb);
         categoryAnnotation(_op, sb);
         parallelAnnotation(_op, sb);
@@ -84,6 +90,46 @@ class OperatorGenerator {
         sb.append("  }\n");
 
         return sb.toString();
+    }
+    
+    /**
+     * Generically generate annotations.
+     * 
+     * @see OpProperties.ANNOTATIONS
+     */
+    static void genericAnnotations(JsonObject op, StringBuilder sb) {
+        JsonArray annotations = GsonUtilities.array(op, OpProperties.ANNOTATIONS);
+        if (annotations == null)
+            return;
+        for (JsonElement a : annotations) {
+            JsonObject annotation = a.getAsJsonObject();
+            sb.append('@');
+            sb.append(jstring(annotation, OpProperties.ANNOTATION_TYPE));
+            sb.append('(');
+            JsonObject properties = GsonUtilities.object(annotation, OpProperties.ANNOTATION_PROPERTIES);
+            boolean first = true;
+            for (Entry<String, JsonElement> property : properties.entrySet()) {
+                if (!first)
+                    sb.append(',');
+                sb.append(property.getKey());
+                sb.append('=');
+                if (property.getValue().isJsonPrimitive()) {
+                    JsonPrimitive value = property.getValue().getAsJsonPrimitive();
+                    if (value.isString())
+                        sb.append(SPLGenerator.stringLiteral(value.getAsString()));
+                    else
+                        sb.append(value.getAsString());
+                } else {
+                    SPLGenerator.value(sb, property.getValue().getAsJsonObject());
+                }
+                if (first)
+                    first = false;
+
+            }
+            
+            sb.append(')');
+            sb.append('\n');
+        }
     }
 
     private static void noteAnnotations(JsonObject op, StringBuilder sb) throws IOException {
@@ -408,16 +454,21 @@ class OperatorGenerator {
                 sb.append("; ");
 
             AtomicBoolean firstStream = new AtomicBoolean(true);
+            String[] firstStreamName = new String[1];
             stringArray(input, "connections", name -> {
                 if (!firstStream.getAndSet(false))
                     sb.append(", ");
+                else
+                    firstStreamName[0] = name;
                 sb.append(getSPLCompatibleName(name));
             });
             
             String alias = jstring(input, "alias");
             if (alias != null) {
-                sb.append(" as ");
-                sb.append(getSPLCompatibleName(alias));
+                if (!alias.equals(firstStreamName[0])) {
+                    sb.append(" as ");
+                    sb.append(getSPLCompatibleName(alias));
+                }
             }
         });
 
@@ -685,17 +736,22 @@ class OperatorGenerator {
             StringBuilder sbPlacement = new StringBuilder();
 
             String colocateKey = jstring(placement, OpProperties.PLACEMENT_COLOCATE_KEY);
-            //String colocateKey = colocateTags != null && colocateTags.size() >= 1 ? colocateTags.get(0).getAsString() : null;
-            //String colocateTag = jstring(placement, OpProperties.PLACEMENT_COLOCATE_KEY);
             if (colocateKey != null) {
-                JsonObject mapping = object(graphConfig, CFG_COLOCATE_TAG_MAPPING);               
+                JsonObject mapping = object(graphConfig, CFG_COLOCATE_TAG_MAPPING);  
                 String colocationId = jstring(mapping, colocateKey);               
                 JsonObject colocateIds = object(graphConfig, CFG_COLOCATE_IDS);
                 JsonObject idInfo = object(colocateIds, colocationId);
                 
+                /*
+                 * If a colocate tag is used in the main composite
+                 * then it must be absolute.
+                 * 
+                 * If it is used in multiple parallel composites
+                 * then it must be absolute.
+                 */
                 boolean absoluteColocate = jboolean(idInfo, "main");
                 if (!absoluteColocate) {
-                    int parallel = idInfo.get("parallel").getAsInt();
+                    int parallel = idInfo.get("parallelUse").getAsInt();
                     if (parallel >= 2)
                         absoluteColocate = true;
                 }
@@ -760,10 +816,20 @@ class OperatorGenerator {
                 return jstring(hostPoolDef, "name");
             }
         }
+        
+        // Sort the resource tags into order and use that as the basis for the name.
+        List<String> sorted = new ArrayList<>(uniqueResourceTags);
+        Collections.sort(sorted, Collator.getInstance(Locale.US));
+        StringBuilder sb = new StringBuilder();
+        sb.append("HostPool");
+        for (String tag : sorted) {
+        	sb.append('_');
+        	sb.append(getSPLCompatibleName(tag));
+        }
+        String hostPool = sb.toString();
 
         JsonObject hostPoolDef = new JsonObject();
-        String hostPool;
-        hostPoolDef.addProperty("name", hostPool = "__jaaHostPool" + hostPools.size());
+        hostPoolDef.addProperty("name", hostPool);
         JsonArray rta = new JsonArray();
         for (String tag : uniqueResourceTags)
             rta.add(new JsonPrimitive(tag));

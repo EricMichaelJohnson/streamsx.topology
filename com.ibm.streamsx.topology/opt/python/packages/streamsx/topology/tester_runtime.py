@@ -20,6 +20,7 @@ the runtime execution code from the test definition module
 
 """
 
+from __future__ import unicode_literals
 from future.builtins import *
 
 import streamsx.ec as ec
@@ -33,6 +34,8 @@ import threading
 import time
 
 _logger = logging.getLogger('streamsx.topology.test')
+
+_STANDALONE_FAILED = False
 
 class Condition(object):
     """A condition for testing.
@@ -85,6 +88,8 @@ class _FunctionalCondition(Condition):
     def valid(self, v):
         if self._fail:
            return
+        if v and not self._valid:
+            _logger.info("Condition:%s: VALID", self.name)
         self._metric_valid.value = 1 if v else 0
         self._valid = v
         self._show_progress()
@@ -98,11 +103,15 @@ class _FunctionalCondition(Condition):
         Marks the condition as failed. Once a condition has failed it
         can never become valid, the test that uses the condition will fail.
         """
+        if not self._fail:
+            _logger.error("Condition:%s: FAILED", self.name)
         self._metric_fail.value = 1
         self.valid = False
         self._fail = True
         if (ec.is_standalone()):
-            raise AssertionError("Condition failed:" + str(self))
+            global _STANDALONE_FAILED
+            _STANDALONE_FAILED = True
+            raise AssertionError("Condition:{}: FAILED".format(self.name))
 
     def __getstate__(self):
         # Remove metrics from saved state.
@@ -116,6 +125,8 @@ class _FunctionalCondition(Condition):
         return state
 
     def __enter__(self):
+        # Provide breadcrumbs of what the check is.
+        _logger.debug(str(self))
         self._metric_valid = self._create_metric("valid", kind='Gauge')
         self._metric_seq = self._create_metric("seq")
         self._metric_fail = self._create_metric("fail", kind='Gauge')
@@ -127,16 +138,15 @@ class _FunctionalCondition(Condition):
             self.valid = self._valid
          
     def __exit__(self, exc_type, exc_value, traceback):
-        if self._fail:
-            _logger.error("Condition:%s: Failed. %s", self.name, str(self))
-        elif self.valid:
-            _logger.info("Condition:%s: Valid. %s", self.name, str(self))
-        else:
-            _logger.error("Condition:%s: Not valid. %s", self.name, str(self))
+        if not self._fail and not self.valid:
+            _logger.warning("Condition:%s: NOT VALID.", self.name)
             
-        if ec.is_standalone():
+        # Force a non-zero return code in standalone
+        # if a condition did not become valid
+        global _STANDALONE_FAILED
+        if ec.is_standalone() and not _STANDALONE_FAILED:
             if exc_type is None and not self._valid:
-                raise AssertionError("Condition did not become valid:" + str(self))
+                raise AssertionError("Condition:{}: NOT VALID.".format(self.name))
 
     def _create_metric(self, mt, kind=None):
         return ec.CustomMetric(self, name=Condition._mn(mt, self.name), kind=kind)
@@ -220,24 +230,29 @@ class _StreamContents(_TupleCount):
             self.valid = True
 
     def _check_for_failure(self):
-        """Check for failure.
+        """Check for failure with ordered tuples.
         """
         tc = len(self.received) - 1
         if self.expected[tc] != self.received[tc]:
-            _logger.error(str(self))
+            _logger.error("Condition:%s: Position %d Expected tuple %s received %s", self.name, tc, self.expected[tc], self.received[tc])
             self.fail()
             return True
         return False
 
     def __str__(self):
-        return "Condition:{}: Stream contents: expected:{} received:{}".format(self.name, str(self.expected), str(self.received))
+        return "Condition:{}: Stream contents: expected:{}".format(self.name, str(self.expected))
 
 class _UnorderedStreamContents(_StreamContents):
     def _check_for_failure(self):
         """Unordered check for failure.
 
-        Can only check when the expected number of tuples have been received.
+        Can only fully check when the expected number of tuples have been received.
         """
+        tuple_ = self.received[-1]
+        if not tuple_ in self.expected:
+            _logger.error("Condition:%s: Tuple count %d Received unexpected tuple %s", self.name, len(self.received), tuple_)
+            self.fail()
+            return True
         if len(self.expected) == len(self.received):
             if collections.Counter(self.expected) != collections.Counter(self.received):
                 self.fail()
@@ -297,19 +312,20 @@ class _Resetter(Condition):
         
 
 class _RunFor(_FunctionalCondition):
-    def __init__(self, duration):
-        super(_RunFor, self).__init__("TestRunTime")
+    def __init__(self, duration, name):
+        super(_RunFor, self).__init__(name)
         self.duration = duration
+        self.start = None
 
     def __iter__(self):
-        start = time.time()
+        self.start = time.time()
         while True:
             time.sleep(1)
-            if (time.time() - start) >= self.duration:
+            if (time.time() - self.start) >= self.duration:
                 self.valid = True
                 return
             self._show_progress()
             yield None
 
     def __str__(self):
-        return "Condition:{}: Run time duration:{} running:{}".format(self.name, str(self.duration), str(time.time() - start))
+        return "Condition:{}: Duration:{} running:{}".format(self.name, str(self.duration), str(time.time() - self.start) if self.start else 0)

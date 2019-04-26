@@ -110,6 +110,9 @@ import importlib
 import logging
 import sys
 
+import streamsx._streams._version
+__version__ = streamsx._streams._version.__version__
+
 try:
     import _streamsx_ec as _ec
 except ImportError:
@@ -132,6 +135,22 @@ def _is_supported():
             pass
     return _State._state is not None and _State._state._supported
 
+def is_active():
+    """Tests is code is active within a IBM Streams exection context.
+ 
+    Returns a true value when called from within a
+    IBM Streams distributed job or standalone execution.
+
+    Can be used to only run code required at runtime, such as importing
+    a module that is only needed at runtime and not topology declaration time.
+
+    Returns:
+        bool: True if running in a IBM Streams context false otherwise.
+
+    .. versionadded:: 1.11
+    """
+    return _is_supported()
+
 def _check():
     if _State._state is None:
         try:
@@ -142,6 +161,30 @@ def _check():
 
     if not _State._state._supported:
         raise NotImplementedError("Access to the execution context requires Streams 4.2 or later")
+
+_SHUTDOWN = threading.Event()
+
+def _prepare_shutdown():
+    _SHUTDOWN.set()
+
+def shutdown():
+    """Return the processing element (PE) shutdown event.
+
+    The event is set when the PE is being shutdown.
+    Can be used in source iterators that need to block by sleeping::
+
+        # Sleep for 60 seconds unless the PE is being shutdown
+        if streamsx.ec.shutdown.wait(60.0):
+            return None
+
+    Code must not call ``set()`` on the returned event.
+
+    Returns:
+        threading.Event: Event object representing PE shutdown.
+    
+    .. versionadded:: 1.11
+    """
+    return _SHUTDOWN
 
 def domain_id():
     """

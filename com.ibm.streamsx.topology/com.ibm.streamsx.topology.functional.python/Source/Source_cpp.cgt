@@ -1,5 +1,9 @@
 <%SPL::CodeGen::implementationPrologue($model);%>
 
+#if SPLPY_OP_STATE_HANDLER == 1
+#include "splpy_sh.h"
+#endif
+
 <% my $pywrapfunc='source_pickle'; %>
 
 MY_OPERATOR::MY_OPERATOR() :
@@ -29,9 +33,9 @@ MY_OPERATOR::MY_OPERATOR() :
  }
 %>
 
-    funcop_ = new SplpyFuncOp(this, SPLPY_OP_STATEFUL, wrapfn);
+    funcop_ = new SplpyFuncOp(this, SPLPY_CALLABLE_STATE_HANDLER, wrapfn);
 
-#if SPLPY_OP_STATEFUL == 1
+#if SPLPY_OP_STATE_HANDLER == 1
    this->getContext().registerStateHandler(*this);
 #endif
 }
@@ -69,19 +73,23 @@ void MY_OPERATOR::process(uint32_t idx)
         ConsistentRegionPermit crp(crc);
 #endif
         {
-            OptionalAutoLock stateLock(this);
+#if SPLPY_OP_STATE_HANDLER == 1
+            SPL::AutoMutex am(mutex_);
+#endif
             try {
                 SplpyGIL lock;
                 Py_CLEAR(pyReturnVar);
                 pyReturnVar = PyObject_CallObject(funcop_->callable(), NULL);
 
-                if (pyReturnVar == NULL)
-                    throw SplpyExceptionInfo::pythonError("source");
- 
-                // Has the iterator completed?
-                if (SplpyGeneral::isNone(pyReturnVar)) {
+                if (pyReturnVar == NULL) {
+                    // Has the iteration completed?
+                    if (PyErr_Occurred() == SplpyErrors::StopIteration)
+                        allDone = true;
+                    else
+                        throw SplpyExceptionInfo::pythonError("source");
+                }
+                else if (SplpyGeneral::isNone(pyReturnVar)) {
                     Py_CLEAR(pyReturnVar);
-                    allDone = true;
                 } else {
                     submitTuple = true;
 

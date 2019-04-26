@@ -19,15 +19,21 @@ def _fetch_from_instance(tc, instance):
     _check_non_empty_list(tc, instance.get_operators(), Operator)
     _check_non_empty_list(tc, instance.get_views(), View)
     _check_non_empty_list(tc, instance.get_operator_connections(), OperatorConnection)
-    _check_non_empty_list(tc, instance.get_resource_allocations(), ResourceAllocation)
-    _check_non_empty_list(tc, instance.get_active_services(), ActiveService)
+    _check_non_empty_list(tc, instance.get_resource_allocations(), ResourceAllocation, none_ok=True)
+    _check_non_empty_list(tc, instance.get_active_services(), ActiveService, none_ok=True)
 
     _check_list(tc, instance.get_exported_streams(), ExportedStream)
-    _check_list(tc, instance.get_hosts(), Host)
+    _check_list(tc, instance.get_hosts(), Host, none_ok=True)
     _check_list(tc, instance.get_imported_streams(), ImportedStream)
     _check_list(tc, instance.get_pe_connections(), PEConnection)
 
-    tc.assertIsInstance(instance.get_domain(), Domain)
+    _check_list(tc, instance.get_application_configurations(), ApplicationConfiguration, none_ok=True)
+    if instance.get_application_configurations() is not None:
+        _check_app_configs(tc, instance)
+
+    d = instance.get_domain()
+    if d is not None:
+        tc.assertIsInstance(d, Domain)
 
 def _check_operators(tc, ops):
     for op in ops:
@@ -78,10 +84,15 @@ def _check_metrics(tc, obj):
         tc.assertIsInstance(m.value, int)
 
 def _check_resource_allocations(tc, obj):
-    for ra in obj.get_resource_allocations():
+    ras = obj.get_resource_allocations()
+    if ras is None:
+        return
+    for ra in ras:
         _check_resource_allocation(tc, ra)
 
 def _check_resource_allocation(tc, ra):
+    if ra is None:
+        return
     tc.assertIsInstance(ra, ResourceAllocation)
     tc.assertIsInstance(ra.applicationResource, bool)
     tc.assertIsInstance(ra.schedulerStatus, str)
@@ -116,8 +127,8 @@ def _fetch_from_job(tc, job):
     _check_non_empty_list(tc, job.get_operator_connections(), OperatorConnection)
 
     # See issue 952
-    if tc.test_ctxtype != 'STREAMING_ANALYTICS_SERVICE' or tc.is_v2:
-        _check_non_empty_list(tc, job.get_resource_allocations(), ResourceAllocation)
+    if tc.test_ctxtype != 'STREAMING_ANALYTICS_SERVICE' or not tc.is_v2:
+        _check_non_empty_list(tc, job.get_resource_allocations(), ResourceAllocation, none_ok=True)
 
     # Presently, application logs can only be fetched from the Stream Analytics Service
     if tc.test_ctxtype == 'STREAMING_ANALYTICS_SERVICE':
@@ -221,11 +232,58 @@ def _fetch_from_job(tc, job):
 
         shutil.rmtree(td)
 
-    _check_list(tc, job.get_hosts(), Host)
+    _check_list(tc, job.get_hosts(), Host, none_ok=True)
     _check_list(tc, job.get_pe_connections(), PEConnection)
 
     tc.assertIsInstance(job.get_instance(), Instance)
-    tc.assertIsInstance(job.get_domain(), Domain)
+    d = job.get_domain()
+    if d is not None:
+        tc.assertIsInstance(d, Domain)
+
+def _check_app_configs(tc, instance):
+    name = 'TEST_AC' +  ''.join(random.choice('0123456789abcdef') for x in range(20))
+    description = 'Description of ' + name
+    ac = instance.create_application_configuration(name, {'A':'one', 'B':2}, description)
+    tc.assertEqual(name, ac.name)
+    tc.assertEqual(description, ac.description)
+    tc.assertEqual({'A':'one', 'B':'2'}, ac.properties)
+    ac.refresh()
+    tc.assertEqual(name, ac.name)
+    tc.assertEqual(description, ac.description)
+    tc.assertEqual({'A':'one', 'B':'2'}, ac.properties)
+
+    description = 'Better description of ' + name
+    ac.update(description=description)
+    tc.assertEqual(name, ac.name)
+    tc.assertEqual(description, ac.description)
+    tc.assertEqual({'A':'one', 'B':'2'}, ac.properties)
+
+    ac2 = ac.update({'B':None, 'C': 'the sea'})
+    tc.assertSame(ac, ac2)
+    tc.assertEqual(name, ac.name)
+    tc.assertEqual(description, ac.description)
+    tc.assertEqual({'A':'one', 'C':'the sea'}, ac.properties)
+
+    ac.update({'A':'one plus'})
+    tc.assertEqual(name, ac.name)
+    tc.assertEqual(description, ac.description)
+    tc.assertEqual({'A':'one plus', 'C':'the sea'}, ac.properties)
+
+    seen_ac = False
+    for rac in instance.get_application_configurations():
+        self.assertIsInstance(rac, ApplicationConfiguration)
+        if rac.name == name:
+            seen_ac = True
+            break
+    self.assertTrue(seen_ac)
+
+    lac = instance.get_application_configurations(name=name)
+    self.assertEqual(1, len(lac))
+    self.assertEqual(name, lac[0].name)
+
+    ac.delete()
+    lac = instance.get_application_configurations(name=name)
+    self.assertEqual(0, len(lac))
 
 def check_domain(tc, domain):
     """Basic test of calls against an Domain """
@@ -235,20 +293,24 @@ def check_domain(tc, domain):
 
 def _fetch_from_domain(tc, domain):
     _check_non_empty_list(tc, domain.get_instances(), Instance)
-    _check_non_empty_list(tc, domain.get_active_services(), ActiveService)
+    _check_non_empty_list(tc, domain.get_active_services(), ActiveService, none_ok=True)
     
     # See issue 952
     if tc.test_ctxtype != 'STREAMING_ANALYTICS_SERVICE':
-        _check_non_empty_list(tc, domain.get_resource_allocations(), ResourceAllocation)
+        _check_non_empty_list(tc, domain.get_resource_allocations(), ResourceAllocation, none_ok=True)
         _check_resource_allocations(tc, domain)
     _check_non_empty_list(tc, domain.get_resources(), Resource)
 
-    _check_list(tc, domain.get_hosts(), Host)
+    _check_list(tc, domain.get_hosts(), Host, none_ok=True)
 
-def _check_non_empty_list(tc, items, expect_class):
+def _check_non_empty_list(tc, items, expect_class, none_ok=False):
+    if items is None and none_ok:
+        return
     tc.assertTrue(items)
     _check_list(tc, items, expect_class)
 
-def _check_list(tc, items, expect_class):
+def _check_list(tc, items, expect_class, none_ok=False):
+    if items is None and none_ok:
+        return
     for item in items:
         tc.assertIsInstance(item, expect_class)

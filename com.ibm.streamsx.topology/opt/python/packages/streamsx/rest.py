@@ -11,8 +11,25 @@ Streams REST API
 
 The Streams REST API provides programmatic access to configuration and status information for IBM Streams objects such as domains, instances, and jobs. 
 
-:py:class:`StreamsConnection` is the entry point to using the Streams REST API
-from Python. Through its functions and the returned objects status information
+IBM Cloud Private for Data
+==========================
+
+Within ICPD
+-----------
+
+:py:meth:`~streamsx.rest_primitives.Instance.of_service` is the entry point to using the Streams REST API bindings,
+returning an :py:class:`~streamsx.rest_primitives.Instance`.
+The configuration required to connect is obtained from ``ipcd_util.get_service_details`` passing in
+the IBM Streams service instance name.
+
+The call to ``ipcd_util.get_service_details`` can be code injected into a Jupyter notebook within
+an ICPD project by selecting the service instance.
+
+IBM Streams On-premises
+=======================
+
+:py:class:`StreamsConnection` is the entry point to using the Streams REST API bindings.
+Through its functions and the returned objects status information
 can be obtained for items such as :py:class:`instances <.rest_primitives.Instance>` and :py:class:`jobs <.rest_primitives.Job>`.
 
 ****************************
@@ -42,6 +59,9 @@ import logging
 import requests
 from pprint import pformat
 import streamsx.topology.context
+
+import streamsx._streams._version
+__version__ = streamsx._streams._version.__version__
 
 from streamsx import st
 from .rest_primitives import (Domain, Instance, Installation, RestResource, _StreamsRestClient, StreamingAnalyticsService, _streams_delegator,
@@ -79,9 +99,12 @@ class StreamsConnection:
     Attributes:
         session (:py:class:`requests.Session`): Requests session object for making REST calls.
     """
-    def __init__(self, username=None, password=None, resource_url=None):
+    def __init__(self, username=None, password=None, resource_url=None, auth=None):
         """specify username, password, and resource_url"""
-        if username and password:
+        streamsx._streams._version._mismatch_check(__name__)
+        if auth:
+            pass
+        elif username and password:
             # resource URL can be obtained via streamtool geturl or REST call
             pass
         elif st._has_local_install:
@@ -96,11 +119,15 @@ class StreamsConnection:
             resource_url = os.environ['STREAMS_REST_URL']
         
         self._resource_url = resource_url
-        self.rest_client = _StreamsRestClient(username, password)
+        if auth:
+            self.rest_client = _StreamsRestClient(auth)
+        else:
+            self.rest_client = _StreamsRestClient._of_basic(username, password)
         self.rest_client._sc = self
         self.session = self.rest_client.session
         self._analytics_service = False
         self._delegator_impl = None
+        self._domains = None
 
     @property
     def _delegator(self):
@@ -115,15 +142,14 @@ class StreamsConnection:
         return self._resource_url
 
     def _get_elements(self, resource_name, eclass, id=None):
-        elements = []
         for resource in self.get_resources():
             if resource.name == resource_name:
+                elements = []
                 for json_element in resource.get_resource()[resource_name]:
                     if not _exact_resource(json_element, id):
                         continue
                     elements.append(eclass(json_element, self.rest_client))
-
-        return elements
+                return elements
 
     def _get_element_by_id(self, resource_name, eclass, id):
         """Get a single element matching an id"""
@@ -140,7 +166,10 @@ class StreamsConnection:
         Returns:
             :py:obj:`list` of :py:class:`~.rest_primitives.Domain`: List of available domains
         """
-        return self._get_elements('domains', Domain)
+        # Domains are fixed and actually only one per REST api.
+        if self._domains is None:
+            self._domains = self._get_elements('domains', Domain)
+        return self._domains
 
     def get_domain(self, id):
         """Retrieves available domain matching a specific domain ID
@@ -155,7 +184,7 @@ class StreamsConnection:
             ValueError: No matching domain exists.
         """
         return self._get_element_by_id('domains', Domain, id)
-
+  
     def get_instances(self):
         """Retrieves available instances.
 
@@ -218,6 +247,7 @@ class StreamingAnalyticsConnection(StreamsConnection):
     .. seealso: :ref:`sas-access`
     """
     def __init__(self, vcap_services=None, service_name=None):
+        streamsx._streams._version._mismatch_check(__name__)
         self.service_name = service_name or os.environ.get('STREAMING_ANALYTICS_SERVICE_NAME')
         self.credentials = _get_credentials(_get_vcap_services(vcap_services), self.service_name)
         self._resource_url = None
@@ -229,12 +259,13 @@ class StreamingAnalyticsConnection(StreamsConnection):
         if self._iam:
             self.rest_client = _IAMStreamsRestClient._create(self.credentials)
         else:
-            self.rest_client = _StreamsRestClient(self.credentials['userid'], self.credentials['password'])
+            self.rest_client = _StreamsRestClient._of_basic(self.credentials['userid'], self.credentials['password'])
         self.rest_client._sc = self
         self.session = self.rest_client.session
         self._analytics_service = True
         self._sas = StreamingAnalyticsService(self.rest_client, self.credentials)
         self._delegator_impl = self._sas._delegator
+        self._domains = None
 
     @staticmethod
     def of_definition(service_def):

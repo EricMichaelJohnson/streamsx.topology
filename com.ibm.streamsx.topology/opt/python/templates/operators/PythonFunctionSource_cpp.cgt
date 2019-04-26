@@ -6,7 +6,7 @@
 <%SPL::CodeGen::implementationPrologue($model);%>
 
 <% 
- my $cmnDir = $model->getContext()->getToolkitDirectory()."/opt/.__splpy/common/";
+ my $cmnDir = $model->getContext()->getToolkitDirectory()."/opt/.splpy/common/";
 
  require "splpy_operator.pm";
  require $cmnDir."/splpy.pm";
@@ -14,7 +14,7 @@
  my $module = splpy_Module();
  my $functionName = splpy_FunctionName();
  my @packages = splpy_Packages();
- spl_pip_packages($model, \@packages);
+ spl_pip_packages(splpy_PyMajor(), $model, \@packages);
 
  my $iport;
  
@@ -28,12 +28,16 @@
   my $skip_set_callable = 1;
 %>
 
+#if SPLPY_OP_STATE_HANDLER == 1
+#include "splpy_sh.h"
+#endif
+
 MY_OPERATOR::MY_OPERATOR() :
    pyop_(NULL),
    pyOutNames_0(NULL)
 {
    PyObject * callable;
-@include  "../../opt/.__splpy/common/py_constructor.cgt"
+@include  "../../opt/.splpy/common/py_constructor.cgt"
    
    {
       SplpyGIL lock;
@@ -44,11 +48,11 @@ MY_OPERATOR::MY_OPERATOR() :
              "streamsx.spl.runtime", "_SourceIterable",
              callable, NULL);   
      this->pyop_->setCallable(callable);
-     this->pyop_->setup(SPLPY_OP_STATEFUL);
+     this->pyop_->setup(SPLPY_CALLABLE_STATE_HANDLER);
 
      pyOutNames_0 = Splpy::pyAttributeNames(getOutputPortAt(0));
    }
-#if SPLPY_OP_STATEFUL == 1
+#if SPLPY_OP_STATE_HANDLER == 1
    this->getContext().registerStateHandler(*this);
 #endif
 }
@@ -73,7 +77,7 @@ void MY_OPERATOR::prepareToShutdown()
 }
 
 <%
-  my $no_tuples_action = "allDone=true;";
+  my $call_error_action = "if (PyErr_Occurred() == SplpyErrors::StopIteration) allDone = true; else ";
 %>
 
 void MY_OPERATOR::process(uint32_t idx)
@@ -88,15 +92,16 @@ void MY_OPERATOR::process(uint32_t idx)
         ConsistentRegionPermit crp(crc);
 #endif
         {
-            OptionalAutoLock stateLock(this);
-
+#if SPLPY_OP_STATE_HANDLER == 1
+            SPL::AutoMutex am(mutex_);
+#endif
             // GIL is released across submission
             try {
                 SplpyGIL lock;
                 PyObject *pyTuple = PyTuple_New(0);
                 PyObject *pyDict = NULL;
 
-@include  "../../opt/.__splpy/common/py_functionReturnToTuples.cgt"
+@include  "../../opt/.splpy/common/py_functionReturnToTuples.cgt"
 
             } catch (const streamsx::topology::SplpyExceptionInfo& excInfo) {
                 SPLPY_OP_HANDLE_EXCEPTION_INFO_GIL(excInfo);
@@ -120,7 +125,7 @@ void MY_OPERATOR::process(uint32_t idx)
 }
 
 // Create member function that converts Python tuple to SPL tuple
-@include  "../../opt/.__splpy/common/py_valueToTuples.cgt"
-@include  "../../opt/.__splpy/common/py_pyTupleTosplTuple.cgt"
+@include  "../../opt/.splpy/common/py_valueToTuples.cgt"
+@include  "../../opt/.splpy/common/py_pyTupleTosplTuple.cgt"
 
 <%SPL::CodeGen::implementationEpilogue($model);%>

@@ -46,6 +46,7 @@ import java.util.Set;
 import java.util.concurrent.Future;
 import java.util.jar.JarEntry;
 import java.util.jar.JarOutputStream;
+import java.util.logging.Logger;
 
 import javax.xml.bind.JAXBContext;
 import javax.xml.bind.JAXBException;
@@ -68,6 +69,8 @@ import com.ibm.streamsx.topology.internal.toolkit.info.ToolkitDependencyType;
 import com.ibm.streamsx.topology.internal.toolkit.info.ToolkitInfoModelType;
 
 public class ToolkitRemoteContext extends RemoteContextImpl<File> {
+    
+    protected static final Logger TRACE = Logger.getLogger("com.ibm.streamsx.topology");
     
     /**
      * Location where dependent jars are placed
@@ -98,7 +101,8 @@ public class ToolkitRemoteContext extends RemoteContextImpl<File> {
     }
 
     @Override
-    public Future<File> _submit(JsonObject submission) throws Exception {
+    public Future<File> _submit(JsonObject submission) throws Exception {        
+        report("Generating code");
         JsonObject deploy = deploy(submission);
         
         addSelectDeployToGraphConfig(submission);
@@ -221,21 +225,24 @@ public class ToolkitRemoteContext extends RemoteContextImpl<File> {
         ToolkitInfoModelType info = new ToolkitInfoModelType();
         
         info.setIdentity(new IdentityType());
-        info.getIdentity().setName(toolkitRoot.getName());
+        info.getIdentity().setName(GraphKeys.splAppNamespace(jsonGraph) + "." + GraphKeys.splAppName(jsonGraph));
         info.getIdentity().setDescription(new DescriptionType());
         info.getIdentity().setVersion("1.0.0." + System.currentTimeMillis());
-        info.getIdentity().setRequiredProductVersion("4.0.1.0");
+        info.getIdentity().setRequiredProductVersion(jstring(object(jsonGraph, "config"), CFG_STREAMS_VERSION));
               
         DependenciesType dependencies = new DependenciesType();
         
         List<ToolkitDependencyType> toolkits = dependencies.getToolkit();
         
-        GsonUtilities.objectArray(object(jsonGraph, "spl"), TOOLKITS_JSON, tk -> {
+        GsonUtilities.objectArray(object(jsonGraph, "config", "spl"), TOOLKITS_JSON, tk -> {
             ToolkitDependencyType depTkInfo;
             String root = jstring(tk, "root");
             if (root != null) {
                 try {
-                    depTkInfo = TkInfo.getTookitDependency(root);
+                    depTkInfo = TkInfo.getTookitDependency(root, false);
+                    // Handle missing info.xml
+                    if (depTkInfo == null)
+                        return;
                 } catch (Exception e) {
                     throw new RuntimeException(e);
                 }
@@ -249,7 +256,7 @@ public class ToolkitRemoteContext extends RemoteContextImpl<File> {
         });
         
         File topologyToolkitRoot = TkInfo.getTopologyToolkitRoot();
-        toolkits.add(TkInfo.getTookitDependency(topologyToolkitRoot.getAbsolutePath()));
+        toolkits.add(TkInfo.getTookitDependency(topologyToolkitRoot.getAbsolutePath(), true));
         
         info.setDependencies(dependencies);
         
@@ -301,7 +308,7 @@ public class ToolkitRemoteContext extends RemoteContextImpl<File> {
                 if (srcFile.isFile())
                     copyFile(srcFile, targetDir);
                 else if (srcFile.isDirectory())
-                    copyDirectoryToDirectory(srcFile, targetDir);
+                    copyDirectoryToDirectory(toolkitRoot, srcFile, targetDir);
             }
             // Create a jar from a classes directory.
             else if (inc.has("classes")) {
@@ -331,11 +338,11 @@ public class ToolkitRemoteContext extends RemoteContextImpl<File> {
      * @param srcDir
      * @param dstDir
      */
-    private static void copyDirectoryToDirectory(File srcDir, File dstDir)
+    private static void copyDirectoryToDirectory(File toolkitRoot, File srcDir, File dstDir)
             throws IOException {
         String dirname = srcDir.getName();
         dstDir = new File(dstDir, dirname);
-        copyDirectory(srcDir, dstDir);
+        copyDirectory(toolkitRoot, srcDir, dstDir);
     }
 
     /**
@@ -344,13 +351,19 @@ public class ToolkitRemoteContext extends RemoteContextImpl<File> {
      * @param srcDir
      * @param dstDir
      */
-    private static void copyDirectory(File srcDir, File dstDir) throws IOException {
+    private static void copyDirectory(final File toolkitRoot, File srcDir, final File dstDir) throws IOException {
         final Path targetPath = dstDir.toPath();
         final Path sourcePath = srcDir.toPath();
+        final File canonicalTkRoot = toolkitRoot.getCanonicalFile();
         Files.walkFileTree(sourcePath, new SimpleFileVisitor<Path>() {
             @Override
             public FileVisitResult preVisitDirectory(final Path dir,
                     final BasicFileAttributes attrs) throws IOException {
+                
+                // Avoid recursion.
+                if (canonicalTkRoot.equals(dir.toFile().getCanonicalFile()))
+                    return FileVisitResult.SKIP_SUBTREE;
+                    
                 Files.createDirectories(targetPath.resolve(sourcePath
                         .relativize(dir)));
                 return FileVisitResult.CONTINUE;

@@ -79,9 +79,8 @@ between tuples are within the timeout period the test remains running until ten 
 
 .. note:: The submitted job (application under test) has additional elements (streams & operators) inserted to implement the conditions. These are visible through various APIs including the Streams console raw graph view. Such elements are put into the `Tester` category.
 
-.. warning::
-    Streaming Analytics service or IBM Streams 4.2 or later is required when using `Tester`.
-
+.. note::
+    The package `streamsx.testing <https://pypi.org/project/streamsx.testing/>`_ provides `nose <https://pypi.org/project/nose>`_ plugins to provide control over tests without having to modify their source code.
 
 .. versionchanged:: 1.9 - Python 2.7 supported (except with Streaming Analytics service).
 
@@ -96,17 +95,31 @@ import os
 import unittest
 import logging
 import collections
+import pkg_resources
+import platform
 import threading
 from streamsx.rest import StreamsConnection
 from streamsx.rest import StreamingAnalyticsConnection
+import streamsx.rest_primitives
 from streamsx.topology.context import ConfigParams
 import time
 import json
 import sys
+import warnings
 
 import streamsx.topology.tester_runtime as sttrt
 
+import streamsx._streams._version
+__version__ = streamsx._streams._version.__version__
+
 _logger = logging.getLogger('streamsx.topology.test')
+
+class _TestConfig(dict):
+    def __init__(self, test, entries=None):
+        super(_TestConfig, self).__init__()
+        self._test = test
+        if entries:
+            self.update(entries)
 
 class Tester(object):
     """Testing support for a Topology.
@@ -139,7 +152,24 @@ class Tester(object):
         self._run_for = 0
 
     @staticmethod
-    def setup_standalone(test):
+    def _log_env(test, verbose):
+        streamsx._streams._version._mismatch_check(__name__)
+        if verbose:
+            _logger.propogate = False
+            _logger.setLevel(logging.DEBUG)
+            _logger.addHandler(logging.StreamHandler())
+
+        _logger.debug("Test:%s: PYTHONHOME=%s", test.id(), os.environ.get('PYTHONHOME', '<notset>'))
+        _logger.debug("Test:%s: sys.path=%s", test.id(), sys.path)
+        _logger.debug("Test:%s: tester.__file__=%s", test.id(), __file__)
+        srp = pkg_resources.working_set.find(pkg_resources.Requirement.parse('streamsx'))
+        if srp is None:
+            _logger.debug("Test:%s: streamsx not installed.", test.id())
+        else:
+            _logger.debug("Test:%s: %s installed at %s.", test.id(), srp, srp.location)
+
+    @staticmethod
+    def setup_standalone(test, verbose=None):
         """
         Set up a unittest.TestCase to run tests using IBM Streams standalone mode.
 
@@ -154,18 +184,27 @@ class Tester(object):
         run for time using :py:meth:`run_for` to ensure the test completes
 
         Two attributes are set in the test case:
-         * test_ctxtype - Context type the test will be run in.
-         * test_config- Test configuration.
+
+            * test_ctxtype - Context type the test will be run in.
+            * test_config- Test configuration.
 
         Args:
             test(unittest.TestCase): Test case to be set up to run tests using Tester
+            verbose(bool): If `true` then the ``streamsx.topology.test`` logger is configured at ``DEBUG`` level with output sent to standard error.
 
         Returns: None
         """
         if not 'STREAMS_INSTALL' in os.environ:
             raise unittest.SkipTest("Skipped due to no local IBM Streams install")
+        Tester._log_env(test, verbose)
         test.test_ctxtype = stc.ContextTypes.STANDALONE
-        test.test_config = {}
+        test.test_config = _TestConfig(test)
+        test.addCleanup(Tester._cleanup_config, test)
+
+    @staticmethod
+    def _cleanup_config(test):
+        if hasattr(test, 'test_ctxtype'): del test.test_ctxtype
+        if hasattr(test, 'test_config'): del test.test_config
 
     @staticmethod
     def get_streams_version(test):
@@ -185,7 +224,8 @@ class Tester(object):
             if test.test_ctxtype == stc.ContextTypes.STANDALONE or test.test_ctxtype == stc.ContextTypes.DISTRIBUTED:
                 return Tester._get_streams_product_version()
             if test.test_ctxtype == stc.ContextTypes.STREAMING_ANALYTICS_SERVICE:
-                return '4.2.0.0'
+                sas = Tester._get_sas_conn(test.test_config)
+                return sas.get_instances()[0].activeVersion['productVersion']
         raise ValueError('Tester has not been setup.')
 
     @staticmethod
@@ -246,7 +286,7 @@ class Tester(object):
             raise unittest.SkipTest("Skipped as test requires IBM Streams {0} but {1} is setup for {2}.".format(required_version, Tester.get_streams_version(test), test.test_ctxtype))
 
     @staticmethod
-    def setup_distributed(test):
+    def setup_distributed(test, verbose=None):
         """
         Set up a unittest.TestCase to run tests using IBM Streams distributed mode.
 
@@ -276,46 +316,63 @@ class Tester(object):
                 `Generating authentication keys for IBM Streams <https://www.ibm.com/support/knowledgecenter/SSCRJU_4.2.1/com.ibm.streams.cfg.doc/doc/ibminfospherestreams-user-security-authentication-rsa.html>`_
 
         Two attributes are set in the test case:
-         * test_ctxtype - Context type the test will be run in.
-         * test_config - Test configuration.
+
+             * test_ctxtype - Context type the test will be run in.
+             * test_config - Test configuration.
 
         Args:
             test(unittest.TestCase): Test case to be set up to run tests using Tester
+            verbose(bool): If `true` then the ``streamsx.topology.test`` logger is configured at ``DEBUG`` level with output sent to standard error.
 
         Returns: None
 
         """
-        if not 'STREAMS_INSTALL' in os.environ:
-            raise unittest.SkipTest("Skipped due to no local IBM Streams install")
+        Tester._log_env(test, verbose)
+        test.test_ctxtype = stc.ContextTypes.DISTRIBUTED
+        test.test_config = _TestConfig(test)
+
+    # Distributed setup check is delayed until the test is run
+    # as the connection information can be in the service definition.
+    @staticmethod
+    def _check_setup_distributed(cfg):
+        if streamsx.rest_primitives.Instance._find_service_def(cfg):
+            return
 
         domain_instance_setup = 'STREAMS_INSTANCE_ID' in os.environ and 'STREAMS_DOMAIN_ID' in os.environ
-        rest_setup = 'STREAMS_REST_URL' in os.environ
+        if domain_instance_setup:
+            if not 'STREAMS_INSTALL' in os.environ:
+                raise unittest.SkipTest("Skipped due to no local IBM Streams install")
+            return
 
-        if not domain_instance_setup and not rest_setup:
-            raise unittest.SkipTest("Skipped due missing environment variables")
+        icpd_setup = 'STREAMS_REST_URL' in os.environ and 'STREAMS_PASSWORD' in os.environ
+        if icpd_setup:
+            return
 
-        test.test_ctxtype = stc.ContextTypes.DISTRIBUTED
-        test.test_config = {}
+        raise unittest.SkipTest("No IBM Streams instance definition for DISTRIBUTED")
 
     @staticmethod
-    def setup_streaming_analytics(test, service_name=None, force_remote_build=False):
+    def setup_streaming_analytics(test, service_name=None, force_remote_build=False, verbose=None):
         """
         Set up a unittest.TestCase to run tests using Streaming Analytics service on IBM Cloud.
 
         The service to use is defined by:
-         * VCAP_SERVICES environment variable containing `streaming_analytics` entries.
-         * service_name which defaults to the value of STREAMING_ANALYTICS_SERVICE_NAME environment variable.
+
+            * VCAP_SERVICES environment variable containing `streaming_analytics` entries.
+            * service_name which defaults to the value of STREAMING_ANALYTICS_SERVICE_NAME environment variable.
 
         If VCAP_SERVICES is not set or a service name is not defined, then the test is skipped.
 
         Two attributes are set in the test case:
-         * test_ctxtype - Context type the test will be run in.
-         * test_config - Test configuration.
+
+            * test_ctxtype - Context type the test will be run in.
+            * test_config - Test configuration.
 
         Args:
             test(unittest.TestCase): Test case to be set up to run tests using Tester
             service_name(str): Name of Streaming Analytics service to use. Must exist as an
                 entry in the VCAP services. Defaults to value of STREAMING_ANALYTICS_SERVICE_NAME environment variable.
+            force_remote_build(bool): Force use of the Streaming Analytics build service. If `false` and ``STREAMS_INSTALL`` is set then a local build will be used if the local environment is suitable for the service, otherwise the Streams application bundle is built using the build service.
+            verbose(bool): If `true` then the ``streamsx.topology.test`` logger is configured at ``DEBUG`` level with output sent to standard error.
 
         If run with Python 2 the test is skipped, only Python 3.5
         is supported with Streaming Analytics service.
@@ -334,7 +391,9 @@ class Tester(object):
             service_name = os.environ.get('STREAMING_ANALYTICS_SERVICE_NAME', None)
         if service_name is None:
             raise unittest.SkipTest("Skipped due to no service name supplied")
-        test.test_config = {'topology.service.name': service_name}
+
+        Tester._log_env(test, verbose)
+        test.test_config = _TestConfig(test, {'topology.service.name': service_name})
         if force_remote_build:
             test.test_config['topology.forceRemoteBuild'] = True
 
@@ -490,8 +549,7 @@ class Tester(object):
         The return from `checker` is handled as:
             * ``None`` - The condition requires more tuples to become valid.
             * `true value` - The condition has become valid.
-            * `false value` - The condition has failed. Once a condition has
-                failed it can never become valid.
+            * `false value` - The condition has failed. Once a condition has failed it can never become valid.
 
         Thus `checker` is typically stateful and allows ensuring that
         condition becomes valid from a set of input tuples. For example
@@ -533,6 +591,11 @@ class Tester(object):
 
         The callable can use `submission_result` and `streams_connection` attributes from :py:class:`Tester` instance
         to interact with the job or the running Streams instance.
+        These REST binding classes can be obtained as follows:
+
+            * :py:class:`~streamsx.rest_primitives.Job` - ``tester.submission_result.job``
+            * :py:class:`~streamsx.rest_primitives.Instance` - ``tester.submission_result.job.get_instance()``
+            * :py:class:`~streamsx.rest.StreamsConnection` - ``tester.streams_connection``
 
         Simple example of checking the job is healthy::
 
@@ -636,6 +699,26 @@ class Tester(object):
              ``STREAMS_USERNAME`` and ``STREAMS_PASSWORD`` to define
              the Streams user.
         """
+        if username or password:
+            warnings.warn("Set username and password with environment variables", DeprecationWarning, stacklevel=2)
+        if config is None:
+            config = {}
+        config['topology.alwaysCollectLogs'] = always_collect_logs
+        config['originator'] = 'tester-' + __version__ + ':python-' + platform.python_version() 
+
+        # Look for streamsx.testing plugins
+        # Each action that plugin attached to the test is
+        # called passing Tester, TestCase, context type and config
+        if isinstance(config, _TestConfig):
+            test_ = config._test
+            actions = test_._streamsx_testing_actions if hasattr(test_, '_streamsx_testing_actions') else None
+            if actions:
+                for action in actions:
+                    _logger.debug("Adding nose plugin action %s to topology %s.", str(action), self.topology.name)
+                    action(self, test_, ctxtype, config)
+
+        if stc.ContextTypes.DISTRIBUTED == ctxtype:
+            Tester._check_setup_distributed(config)
 
         # Add the conditions into the graph as sink operators
         _logger.debug("Adding conditions to topology %s.", self.topology.name)
@@ -646,15 +729,13 @@ class Tester(object):
 
         # Standalone uses --kill-after parameter.
         if self._run_for and stc.ContextTypes.STANDALONE != ctxtype:
-            run_cond = sttrt._RunFor(self._run_for)
+            rfn = 'run_for_' + str(int(self._run_for)) + 's'
+            run_cond = sttrt._RunFor(self._run_for, rfn)
             self.add_condition(None, run_cond)
-            cond_run_time = self.topology.source(run_cond, name="TestRunTime")
+            cond_run_time = self.topology.source(run_cond, name=rfn)
             cond_run_time.category = 'Tester'
             cond_run_time._op()._layout(hidden=True)
 
-        if config is None:
-            config = {}
-        config['topology.alwaysCollectLogs'] = always_collect_logs
 
         _logger.debug("Starting test topology %s context %s.", self.topology.name, ctxtype)
 
@@ -703,18 +784,14 @@ class Tester(object):
         return sr['return_code'] == 0
 
     def _distributed_test(self, config, username, password):
-        self.streams_connection = config.get(ConfigParams.STREAMS_CONNECTION)
-        if self.streams_connection is None:
-            # Supply a default StreamsConnection object with SSL verification disabled, because the default
-            # streams server is not shipped with a valid SSL certificate
-            self.streams_connection = StreamsConnection(username, password)
-            self.streams_connection.session.verify = False
-            config[ConfigParams.STREAMS_CONNECTION] = self.streams_connection
         sjr = stc.submit(stc.ContextTypes.DISTRIBUTED, self.topology, config)
         self.submission_result = sjr
         if sjr['return_code'] != 0:
             _logger.error("Failed to submit job to distributed instance.")
             return False
+        self.streams_connection = config.get(ConfigParams.STREAMS_CONNECTION)
+        if self.streams_connection is None:
+            self.streams_connection = self.submission_result.job.rest_client._sc
         return self._distributed_wait_for_result(stc.ContextTypes.DISTRIBUTED, config)
 
 
@@ -723,13 +800,17 @@ class Tester(object):
         self.submission_result = sjr
         self.streams_connection = config.get(ConfigParams.STREAMS_CONNECTION)
         if self.streams_connection is None:
-            vcap_services = config.get(ConfigParams.VCAP_SERVICES)
-            service_name = config.get(ConfigParams.SERVICE_NAME)
-            self.streams_connection = StreamingAnalyticsConnection(vcap_services, service_name)
+            self.streams_connection = Tester._get_sas_conn(config)
         if sjr['return_code'] != 0:
             _logger.error("Failed to submit job to Streaming Analytics instance")
             return False
         return self._distributed_wait_for_result(ctxtype, config)
+
+    @staticmethod
+    def _get_sas_conn(config):
+        vcap_services = config.get(ConfigParams.VCAP_SERVICES)
+        service_name = config.get(ConfigParams.SERVICE_NAME)
+        return StreamingAnalyticsConnection(vcap_services, service_name)
 
     def _distributed_wait_for_result(self, ctxtype, config):
 
@@ -741,7 +822,7 @@ class Tester(object):
             if self.local_check is not None:
                 self._local_thread.join()
         else:
-            _logger.error ("wait for healthy failed")
+            _logger.error ("Job %s Wait for healthy failed", cc._job_id)
             self.result = cc._end(False, _ConditionChecker._UNHEALTHY)
 
         self.result['submission_result'] = self.submission_result
@@ -804,7 +885,6 @@ class _ConditionChecker(object):
         self.tester = tester
         self._sc = sc
         self._sjr = sjr
-        self._instance_id = sjr['instanceId']
         self._job_id = sjr['jobId']
         self._sequences = {}
         for cn in tester._conditions:
@@ -814,7 +894,7 @@ class _ConditionChecker(object):
         self.waits = 0
         self.additional_checks = 2
 
-        self.job = self._find_job()
+        self.job = self._sjr.job
 
     # Wait for job to be healthy. Returns True
     # if the job became healthy, False if not.
@@ -826,7 +906,7 @@ class _ConditionChecker(object):
                 self.waits = 0
                 return True
             if ok_ is False: # actually failed
-                _logger.error ("wait for healthy actually failed")
+                _logger.error ("Job %s wait for healthy actually failed", self._job_id)
                 return False
 
             # ok_ is number of ok PEs
@@ -839,7 +919,7 @@ class _ConditionChecker(object):
                 ok_pes = ok_
             time.sleep(self.delay)
         else:
-            _logger.error ("timed out waiting for healthy")
+            _logger.error ("Job %s Timed out waiting for healthy", self._job_id)
 
         return self._check_job_health(verbose=True)
 
@@ -859,7 +939,7 @@ class _ConditionChecker(object):
                 self.waits += 1
             time.sleep(self.delay)
         else:
-            _logger.error("timed out waiting for test to complete")
+            _logger.error("Job %s Timed out waiting for test to complete", self._job_id)
 
         return self._end(False, check)
 
@@ -923,29 +1003,32 @@ class _ConditionChecker(object):
         ok_ = self.job.health == 'healthy'
         if not ok_:
             if verbose:
-                _logger.error("Job %s health:%s", self.job.name, self.job.health)
+                _logger.error("Job %s (%s) health:%s", self.job.name, self._job_id, self.job.health)
             if not start:
                 return False
         ok_pes = 0
-        for pe in self.job.get_pes():
+        pes = self.job.get_pes()
+        if verbose:
+            _logger.info("Job %s health:%s PE count:%d", self.job.name, self.job.health, len(pes))
+        for pe in pes:
             if pe.launchCount == 0:
+                if verbose:
+                    _logger.warn("Job %s PE %s launch count == 0", self._job_id, pe.id)
                 continue # not a test failure, but not an ok_pe either
             if pe.launchCount > 1:
                 if verbose or start:
-                    _logger.error("PE %s launch count > 1: %s", pe.id, pe.launchCount)
+                    _logger.error("Job %s PE %s launch count > 1: %s", self._job_id, pe.id, pe.launchCount)
                 return False
             if pe.health != 'healthy':
                 if verbose:
-                    _logger.error("PE %s health: %s", pe.id, pe.health)
+                    _logger.error("Job %s PE %s health: %s", self._job_id, pe.id, pe.health)
                 if not start:
                     return False
             else:
+                if verbose:
+                    _logger.info("Job %s PE %s health: %s", self._job_id, pe.id, pe.health)
                 ok_pes += 1
         return True if ok_ else ok_pes
-
-    def _find_job(self):
-        instance = self._sc.get_instance(id=self._instance_id)
-        return instance.get_job(id=self._job_id)
 
     def _get_job_metrics(self):
         """Fetch all the condition metrics for a job.

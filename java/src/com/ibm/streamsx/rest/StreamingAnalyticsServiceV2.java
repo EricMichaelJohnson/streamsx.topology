@@ -12,8 +12,10 @@ import java.io.File;
 import java.io.IOException;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
+import java.util.logging.Level;
 
 import org.apache.http.HttpEntity;
+import org.apache.http.client.fluent.Executor;
 import org.apache.http.client.methods.HttpGet;
 import org.apache.http.client.methods.HttpPost;
 import org.apache.http.entity.ContentType;
@@ -22,6 +24,8 @@ import org.apache.http.entity.mime.content.FileBody;
 import org.apache.http.entity.mime.content.StringBody;
 import org.apache.http.impl.client.CloseableHttpClient;
 
+import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 
 class StreamingAnalyticsServiceV2 extends AbstractStreamingAnalyticsService {
@@ -106,6 +110,8 @@ class StreamingAnalyticsServiceV2 extends AbstractStreamingAnalyticsService {
         }
         return buildsUrl;
     }
+    
+    
 
     private synchronized void setUrls(JsonObject statusResponse)
             throws IllegalStateException {
@@ -148,10 +154,15 @@ class StreamingAnalyticsServiceV2 extends AbstractStreamingAnalyticsService {
 
     @Override
     protected JsonObject submitBuild(CloseableHttpClient httpclient,
-            File archive, String buildName)
+            File archive, String buildName, String originator)
             throws IOException {
         String newBuildURL = getBuildsUrl(httpclient);
+        
+        newBuildURL = newBuildURL + "?originator=" +
+            URLEncoder.encode(originator, StandardCharsets.UTF_8.name());
+        
         HttpPost httppost = new HttpPost(newBuildURL);
+        
         httppost.addHeader("Authorization", getAuthorization());
 
         JsonObject buildParams = new JsonObject();
@@ -198,4 +209,25 @@ class StreamingAnalyticsServiceV2 extends AbstractStreamingAnalyticsService {
         return StreamingAnalyticsConnectionV2.of(this, service, false);
     }
 
+    @Override
+    protected boolean downloadArtifacts(CloseableHttpClient httpclient, JsonArray artifacts) {
+        boolean downloaded = false;
+        for (JsonElement ae : artifacts) {
+            JsonObject artifact = ae.getAsJsonObject();
+            if (!artifact.has("download"))
+                continue;
+            
+            String name = jstring(artifact, "name");
+            String url = jstring(artifact, "download");
+           
+            // Don't fail the submit if we fail to download the sab(s).
+            try {
+                StreamsRestUtils.getFile(Executor.newInstance(httpclient), getAuthorization(), url, new File(name));
+            } catch (IOException e) {
+                TRACE.warning("Failed to download sab: " + name + " : " + e.getMessage());
+            }
+            downloaded = true;
+        }
+        return downloaded;
+    }
 }

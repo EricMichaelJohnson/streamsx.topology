@@ -40,13 +40,19 @@ version of the Python topology that includes application
 specific Python C extensions to optimize performance.
 
 The bundle also includes any required Python packages or modules
-that were used in the declaration of the application. For example
-the Python module containing the callable used in a
-:py:meth:`~Stream.map` invocation. These modules are copied into
-the bundle from their local location. This allows the bundle to
-be self-contained, and thus not the Streams instance have all the required
-Python packages pre-installed. The addition of packages to the bundle
-can be controlled with :py:attr:`Topology.include_packages` and
+that were used in the declaration of the application, excluding
+ones that are in a directory path containing ``site-packages``.
+
+The Python standard package tool ``pip`` uses a directory structure
+including ``site-packages`` when installing packages. Packages installed
+with ``pip`` can be included in the bundle with
+:py:meth:`~Topology.add_pip_package` when using a build service.
+This avoids the requirement to have packages be preinstalled in cloud environments.
+
+Local Python packages and modules containing callables used in transformations
+such as :py:meth:`~Stream.map` are copied into the bundle from their
+local location.  The addition of local packages to the bundle can be controlled
+with :py:attr:`Topology.include_packages` and
 :py:attr:`Topology.exclude_packages`.
 
 The Streams runtime distributes the application's operations
@@ -114,8 +120,7 @@ Use of a class instance allows the operation to be stateful by maintaining state
 attributes across invocations.
 
 .. note::
-    For future compatibility instances should ensure that the object's
-    state can be pickled. See https://docs.python.org/3.5/library/pickle.html#handling-stateful-objects
+    For support with consistent region or checkpointing instances should ensure that the object's state can be pickled. See https://docs.python.org/3.5/library/pickle.html#handling-stateful-objects
 
 Initialization and shutdown
 ===========================
@@ -203,12 +208,14 @@ try:
 except (ImportError,NameError):
     pass
 
+import streamsx._streams._version
+__version__ = streamsx._streams._version.__version__
+
 import copy
 import random
 import streamsx._streams._placement as _placement
 import streamsx.spl.op
 import streamsx.spl.types
-import streamsx.topology.consistent
 import streamsx.topology.graph
 import streamsx.topology.schema
 import streamsx.topology.functions
@@ -223,6 +230,7 @@ import inspect
 import logging
 import datetime
 import pkg_resources
+import warnings
 from enum import Enum
 
 logger = logging.getLogger('streamsx.topology')
@@ -333,27 +341,21 @@ class SubscribeConnection(Enum):
         return streamsx.spl.op.Expression.expression('com.ibm.streamsx.topology.topic::' + self.name).spl_json()
 
 class Topology(object):
-    """The Topology class is used to define data sources, and is passed as a parameter when submitting an application.
-       Topology keeps track of all sources, sinks, and data operations within your application.
+    """The Topology class is used to define data sources, and is passed as a parameter when submitting an application. Topology keeps track of all sources, sinks, and transformations within your application.
 
-       Submission of a Topology results in a Streams application that has
-       the name `namespace::name`.
+    Submission of a Topology results in a Streams application that has
+    the name `namespace::name`.
 
-       Arguments:
-           name(str): Name of the topology. Defaults to a name dervied
-              from the calling evironment if it can be determined, otherwise
-              a random name.
-           namespace(str): Namespace of the topology. Defaults to a name dervied
-              from the calling evironment if it can be determined, otherwise
-              a random name.
+    Args:
+        name(str): Name of the topology. Defaults to a name dervied from the calling evironment if it can be determined, otherwise a random name.
+        namespace(str): Namespace of the topology. Defaults to a name dervied from the calling evironment if it can be determined, otherwise a random name.
 
-       Attributes:
-           include_packages(set[str]): Python package names to be included in the built application. Any package in this list is copied into the bundle and made available at runtime to the Python callables used in the application. By default a ``Topology`` will automatically discover which packages and modules are required to be copied, this field may be used to add additional packages that were not automatically discovered.
+    Attributes:
+        include_packages(set[str]): Python package names to be included in the built application. Any package in this list is copied into the bundle and made available at runtime to the Python callables used in the application. By default a ``Topology`` will automatically discover which packages and modules are required to be copied, this field may be used to add additional packages that were not automatically discovered. See also :py:meth:`~Topology.add_pip_package`.
 
-           exclude_packages(set[str]): Python top-level package names to be excluded from the built application. Excluding a top-level packages excludes all sub-modules at any level in the package, e.g. `sound` excludes `sound.effects.echo`. Only the top-level package can be defined, e.g. `sound` rather than `sound.filters`. Behavior when adding a module within a package is undefined.
-               When compiling the application using Anaconda this set is pre-loaded with Python packages from the Anaconda pre-loaded set.
+        exclude_packages(set[str]): Python top-level package names to be excluded from the built application. Excluding a top-level packages excludes all sub-modules at any level in the package, e.g. `sound` excludes `sound.effects.echo`. Only the top-level package can be defined, e.g. `sound` rather than `sound.filters`. Behavior when adding a module within a package is undefined. When compiling the application using Anaconda this set is pre-loaded with Python packages from the Anaconda pre-loaded set.
 
-               Package names in `include_packages` take precedence over package names in `exclude_packages`.
+    Package names in `include_packages` take precedence over package names in `exclude_packages`.
 
     All declared streams in a `Topology` are available through their name
     using ``topology[name]``. The stream's name is defined by :py:meth:`Stream.name` and will differ from the name parameter passed when creating the stream if the application uses duplicate names.
@@ -379,6 +381,9 @@ class Topology(object):
                     namespace = si[2].__module__
                 elif si[0] is not None:
                     namespace = os.path.splitext(os.path.basename(si[0]))[0]
+                    if namespace.startswith('<ipython-input'):
+                        if 'DSX_PROJECT_NAME' in os.environ:
+                            namespace = os.environ['DSX_PROJECT_NAME']
         
         if sys.version_info.major == 3:
           self.opnamespace = "com.ibm.streamsx.topology.functional.python"
@@ -391,10 +396,12 @@ class Topology(object):
         self.exclude_packages = set() 
         self._pip_packages = list() 
         self._files = dict()
-        if "Anaconda" in sys.version:
+        if "Anaconda" in sys.version or 'DSX_PROJECT_ID' in os.environ:
             import streamsx.topology.condapkgs
             self.exclude_packages.update(streamsx.topology.condapkgs._CONDA_PACKAGES)
         import streamsx.topology._deppkgs
+        if 'DSX_PROJECT_ID' in os.environ:
+            self.exclude_packages.update(streamsx.topology._deppkgs._ICP4D_NB_PACKAGES)
         self.exclude_packages.update(streamsx.topology._deppkgs._DEP_PACKAGES)
         
         self.graph = streamsx.topology.graph.SPLGraph(self, name, namespace)
@@ -439,7 +446,17 @@ class Topology(object):
 
         Each tuple is a Python object and must be picklable to allow execution of the application
         to be distributed across available resources in the Streams instance.
-        
+
+        If the iterator's ``__iter__`` or ``__next__`` block then shutdown,
+        checkpointing or consistent region processing may be delayed.
+        Having ``__next__`` return ``None`` (no available tuples) or tuples
+        to submit will allow such processing to proceed.
+
+        A shutdown ``threading.Event`` is available through
+        :py:func:`streamsx.ec.shutdown` which becomes set when a shutdown
+        of the processing element has been requested. This event my be waited
+        on to perform a sleep that will terminate upon shutdown.
+
         Args:
             func(callable): An iterable or a zero-argument callable that returns an iterable of tuples.
             name(str): Name of the stream, defaults to a generated name.
@@ -488,6 +505,11 @@ class Topology(object):
         By default a stream is subscribed as :py:const:`~streamsx.topology.schema.CommonSchema.Python` objects
         which connects to streams published to topic by Python Streams applications.
 
+        Structured schemas are subscribed to using an instance of
+        :py:class:`StreamSchema`.  A Streams application publishing
+        structured schema streams may have been implemented in any
+        programming language supported by Streams.
+
         JSON streams are subscribed to using schema :py:const:`~streamsx.topology.schema.CommonSchema.Json`.
         Each tuple on the returned stream will be a Python dictionary
         object created by ``json.loads(tuple)``.
@@ -496,7 +518,7 @@ class Topology(object):
        
         String streams are subscribed to using schema :py:const:`~streamsx.topology.schema.CommonSchema.String`.
         Each tuple on the returned stream will be a Python string object.
-        A Streams application publishing JSON streams may have been implemented in any programming language
+        A Streams application publishing string streams may have been implemented in any programming language
         supported by Streams.
 
         Subscribers can ensure they do not slow down matching publishers
@@ -518,6 +540,7 @@ class Topology(object):
 
         .. seealso:`SubscribeConnection`
         """
+        schema = streamsx.topology.schema._normalize(schema)
         _name = self.graph._requested_name(name, 'subscribe')
         sl = _SourceLocation(_source_info(), "subscribe")
         # subscribe is never stateful
@@ -594,12 +617,13 @@ class Topology(object):
         of the Streams application bundle (`sab` file).
         The package is expected to be available from `pypi.org`.
 
+
         If the package is already installed on the build system
         then it is not added into the `sab` file.
         The assumption is that the runtime hosts for a Streams
         instance have the same Python packages installed as the
-        build machines. This is always true for the Streaming
-        Analytics service on IBM Cloud.
+        build machines. This is always true for IBM Cloud
+        Private for Data and the Streaming Analytics service on IBM Cloud.
 
         The project name extracted from the requirement
         specifier is added to :py:attr:`~exclude_packages`
@@ -624,8 +648,17 @@ class Topology(object):
             requirement(str): Package requirements specifier.
 
         .. warning::
-            Only supported when using the remote build service with
-            the Streaming Analytics service.
+            Only supported when using the build service with
+            a Streams instance in IBM Cloud Private for Data
+            or Streaming Analytics service on IBM Cloud.
+
+        .. note::
+            Installing packages through `pip` is preferred to
+            the automatic dependency checking performed on local
+            modules. This is because `pip` will perform a full
+            install of the package including any dependent packages
+            and additional files, such as shared libraries, that
+            might be missed by dependency discovery.
 
         .. versionadded:: 1.9
         """
@@ -709,8 +742,17 @@ class Topology(object):
         A stateful operator is an operator whose callable is an instance of a
         Python callable class.
 
-        Returns:
-            The checkpoint period.
+        Examples::
+
+            # Create a topology that will checkpoint every thirty seconds
+            topo = Topology()
+            topo.checkpoint_period = 30.0
+
+        ::
+
+            # Create a topology that will checkpoint every two minutes
+            topo = Topology()
+            topo.checkpoint_period = datetime.timedelta(minutes=2)
 
         .. versionadded:: 1.11
         """
@@ -758,7 +800,7 @@ class Topology(object):
         if not self._has_jcp:
             jcp = self.graph.addOperator(kind="spl.control::JobControlPlane", name="JobControlPlane")
             jcp.viewable = False
-            self.has_jcp = True
+            self._has_jcp = True
 
 
 class Stream(_placement._Placement, object):
@@ -773,6 +815,7 @@ class Stream(_placement._Placement, object):
         self._placeable = False
         self._alias = None
         topology._streams[self.oport.name] = self
+        self._json_stream = None
 
     def _op(self):
         if not self._placeable:
@@ -872,6 +915,7 @@ class Stream(_placement._Placement, object):
         .. deprecated:: 1.7
             Replaced by :py:meth:`for_each`.
         """
+        warnings.warn("Use Stream.for_each()", DeprecationWarning, stacklevel=2)
         return self.for_each(func, name)
 
     def filter(self, func, name=None):
@@ -908,6 +952,7 @@ class Stream(_placement._Placement, object):
         return Stream(self.topology, oport)._make_placeable()
 
     def _map(self, func, schema, name=None):
+        schema = streamsx.topology.schema._normalize(schema)
         _name = self.topology.graph._requested_name(name, action="map", func=func)
         stateful = self._determine_statefulness(func)
         op = self.topology.graph.addOperator(self.topology.opnamespace+"::Map", func, name=_name, stateful=stateful)
@@ -923,11 +968,13 @@ class Stream(_placement._Placement, object):
 
         A view is a continually updated sampled buffer of a streams's tuples.
         Views allow visibility into a stream from external clients such
-        as the Streams console,
+        as Jupyter Notebooks, the Streams console,
         `Microsoft Excel <https://www.ibm.com/support/knowledgecenter/SSCRJU_4.2.0/com.ibm.streams.excel.doc/doc/excel_overview.html>`_ or REST clients.
 
         The view created by this method can be used by external clients
-        and through the returned object after the topology is submitted. 
+        and through the returned :py:class:`~streamsx.topology.topology.View` object after the topology is submitted. For example a Jupyter Notebook can
+        declare and submit an application with views, and then
+        use the resultant `View` objects to visualize live data within the streams.
 
         When the stream contains Python objects then they are converted
         to JSON.
@@ -942,17 +989,24 @@ class Stream(_placement._Placement, object):
                 remote client accesses it to retrieve data.
  
         Returns:
-            View object which can be used to access the data when the
+            streamsx.topology.topology.View: View object which can be used to access the data when the
             topology is submitted.
+
+        .. note:: Views are only supported when submitting to distributed
+            contexts including Streaming Analytics service.
         """
         if name is None:
             name = ''.join(random.choice('0123456789abcdef') for x in range(16))
 
         if self.oport.schema == streamsx.topology.schema.CommonSchema.Python:
-            view_stream = self.as_json(force_object=False)._layout(hidden=True)
-            # colocate map operator with stream that is being viewed.
-            if self._placeable:
-                self._colocate(view_stream, 'view')
+            if self._json_stream:
+                view_stream = self._json_stream
+            else:
+                self._json_stream = self.as_json(force_object=False)._layout(hidden=True)
+                view_stream = self._json_stream
+                # colocate map operator with stream that is being viewed.
+                if self._placeable:
+                    self._colocate(view_stream, 'view')
         else:
             view_stream = self
 
@@ -967,7 +1021,7 @@ class Stream(_placement._Placement, object):
             view_config['activateOption'] = 'automatic'
         view_stream.oport.operator.addViewConfig(view_config)
         _view = View(name)
-        self.topology.graph.get_views().append(_view)
+        self.topology.graph._views.append(_view)
         return _view
 
     def map(self, func=None, name=None, schema=None):
@@ -984,16 +1038,17 @@ class Stream(_placement._Placement, object):
         `schema` parameter changes the type of the stream and
         modifies each ``result`` before submission.
 
-        * :py:const:`~streamsx.topology.schema.CommonSchema.Python` - The default:  `result` is submitted.
-        * :py:const:`~streamsx.topology.schema.CommonSchema.String` - A stream of strings: ``str(result)`` is submitted.
-        * :py:const:`~streamsx.topology.schema.CommonSchema.Json` - A stream of JSON objects: ``result`` must be convertable to a JSON object using `json` package.
+        * ``object`` or :py:const:`~streamsx.topology.schema.CommonSchema.Python` - The default:  `result` is submitted.
+        * ``str`` type (``unicode`` 2.7) or :py:const:`~streamsx.topology.schema.CommonSchema.String` - A stream of strings: ``str(result)`` is submitted.
+        * ``json`` or :py:const:`~streamsx.topology.schema.CommonSchema.Json` - A stream of JSON objects: ``result`` must be convertable to a JSON object using `json` package.
         * :py:const:`~streamsx.topology.schema.StreamSchema` - A structured stream. `result` must be a `dict` or (Python) `tuple`. When a `dict` is returned the outgoing stream tuple attributes are set by name, when a `tuple` is returned stream tuple attributes are set by position.
+        * string value - Equivalent to passing ``StreamSchema(schema)``
 
         Args:
             func: A callable that takes a single parameter for the tuple.
                 If not supplied then a function equivalent to ``lambda tuple_ : tuple_`` is used.
             name(str): Name of the mapped stream, defaults to a generated name.
-            schema(StreamSchema): Schema of the resulting stream.
+            schema(StreamSchema|CommonSchema|str): Schema of the resulting stream.
 
         If invoking ``func`` for a tuple on the stream raises an exception
         then its processing element will terminate. By default the processing
@@ -1031,6 +1086,7 @@ class Stream(_placement._Placement, object):
         .. deprecated:: 1.7
             Replaced by :py:meth:`map`.
         """
+        warnings.warn("Use Stream.map()", DeprecationWarning, stacklevel=2)
         return self.map(func, name)
              
     def flat_map(self, func=None, name=None):
@@ -1091,6 +1147,7 @@ class Stream(_placement._Placement, object):
         .. deprecated:: 1.7
             Replaced by :py:meth:`flat_map`.
         """
+        warnings.warn("Use Stream.flat_map()", DeprecationWarning, stacklevel=2)
         return self.flat_map(func, name)
 
     def isolate(self):
@@ -1117,8 +1174,6 @@ class Stream(_placement._Placement, object):
             Stream
         """
         op = self.topology.graph.addOperator("$LowLatency$")
-        # include_packages=self.include_packages, exclude_packages=self.exclude_packages)
-        # include_packages=self.include_packages, exclude_packages=self.exclude_packages)
         op.addInputPort(outputPort=self.oport)
         oport = op.addOutputPort(schema=self.oport.schema)
         return Stream(self.topology, oport)
@@ -1138,24 +1193,82 @@ class Stream(_placement._Placement, object):
     
     def parallel(self, width, routing=Routing.ROUND_ROBIN, func=None, name=None):
         """
-        Parallelizes the stream into `width` parallel channels.
-        Tuples are routed to parallel channels such that an even distribution is maintained.
-        Each parallel channel can be thought of as being assigned its own thread.
-        As such, each parallelized stream function are separate instances and operate independently 
-        from one another.
-        
-        parallel() will only parallelize the stream operations performed after the call to parallel() and 
-        before the call to :py:meth:`~Stream.end_parallel`.
-        
-        Parallel regions aren't required to have an output stream, and thus may be used as sinks.
-        In other words, a parallel sink is created by calling parallel() and creating a sink operation.
-        It is not necessary to invoke end_parallel() on parallel sinks.
-        
-        Every call to end_parallel() must have a call to parallel() preceding it.
+        Split stream into channels and start a parallel region.
+
+        Returns a new stream that will contain the contents of
+        this stream with tuples distributed across its channels.
+
+        The returned stream starts a parallel region where all
+        downstream transforms are replicated across `width` channels.
+        A parallel region is terminated by :py:meth:`end_parallel`
+        or :py:meth:`for_each`.
+
+        Any transform (such as :py:meth:`map`, :py:meth:`filter`, etc.) in
+        a parallel region has a copy of its callable executing
+        independently in parallel. Channels remain independent
+        of other channels until the region is terminated.
+
+        For example with this topology fragment a parallel region
+        of width 3 is created::
+
+            s = ...
+            p = s.parallel(3)
+            p = p.filter(F()).map(M())
+            e = p.end_parallel()
+            e.for_each(E())
+
+        Tuples from ``p`` (parallelized ``s``)  are distributed
+        across three channels, 0, 1 & 2
+        and are independently processed by three instances of ``F`` and ``M``.
+        The tuples that pass the filter ``F`` in channel 0 are then mapped
+        by the instance of ``M`` in channel 0, and so on for channels 1 and 2.
+
+        The channels are combined by ``end_parallel`` and so a single instance
+        of ``E`` processes all the tuples from channels 0, 1 & 2.
+
+        This stream instance (the original) is outside of the parallel region
+        and so any downstream transforms are executed normally.
+        Adding this `map` transform would result in tuples
+        on ``s`` being processed by a single instance of ``N``::
+
+            n = s.map(N())
+
+        The number of channels is set by `width` which may be an `int` greater
+        than zero or a submission parameter created by
+        :py:meth:`Topology.create_submission_parameter`.
+
+        With IBM Streams 4.3 or later the number of channels can be
+        dynamically changed at runtime.
+
+        Tuples are routed to channels based upon `routing`, see :py:class:`Routing`.
+
+        A parallel region can have multiple termination points, for
+        example when a stream within the stream has multiple transforms
+        against it::
+
+            s = ...
+            p = s.parallel(3)
+            m1p = p.map(M1())
+            m2p = p.map(M2())
+            p.for_each(E())
+
+            m1 = m1p.end_parallel()
+            m2 = m2p.end_parallel()
+
+        Parallel regions can be nested, for example::
+
+            s = ...
+            m = s.parallel(2).map(MO()).parallel(3).map(MI()).end_parallel().end_parallel()
+
+        In this case there will be two instances of ``MO`` (the outer region) and six (2x3) instances of ``MI`` (the inner region).
+         
+        Streams created by :py:meth:`~Topology.source` or
+        :py:meth:`~Topology.subscribe` are placed in a parallel region
+        by :py:meth:`set_parallel`.
         
         Args:
             width (int): Degree of parallelism.
-            routing(Routing): denotes what type of tuple routing to use.
+            routing(Routing): Denotes what type of tuple routing to use.
             func: Optional function called when :py:const:`Routing.HASH_PARTITIONED` routing is specified.
                 The function provides an integer value to be used as the hash that determines
                 the tuple channel routing.
@@ -1164,6 +1277,7 @@ class Stream(_placement._Placement, object):
         Returns:
             Stream: A stream for which subsequent transformations will be executed in parallel.
 
+        .. seealso:: :py:meth:`set_parallel`, :py:meth:`end_parallel`
         """
         _name = name
         if _name is None:
@@ -1228,6 +1342,8 @@ class Stream(_placement._Placement, object):
 
         Returns:
             Stream: Stream for which subsequent transformations are no longer parallelized.
+
+        .. seealso:: :py:meth:`set_parallel`, :py:meth:`parallel`
         """
         outport = self.oport
         if isinstance(self.oport.operator, streamsx.topology.graph.Marker):
@@ -1243,13 +1359,62 @@ class Stream(_placement._Placement, object):
 
     def set_parallel(self, width, name=None):
         """
-        Indicates that the stream is the start of a parallel region. Should only be invoked on source operators.
+        Set this source stream to be split into multiple channels
+        as the start of a parallel region.
+
+        Calling ``set_parallel`` on a stream created by
+        :py:meth:`~Topology.source` results in the stream
+        having `width` channels, each created by its own instance
+        of the callable::
+
+           s = topo.source(S())
+           s.set_parallel(3)
+           f = s.filter(F())
+           e = f.end_parallel()
+
+        Each channel has independent instances of ``S`` and ``F``. Tuples
+        created by the instance of ``S`` in channel 0 are passed to the
+        instance of ``F`` in channel 0, and so on for channels 1 and 2.
+
+        Callable transforms instances within the channel can use
+        the runtime functions
+        :py:func:`~streamsx.ec.channel`, 
+        :py:func:`~streamsx.ec.local_channel`, 
+        :py:func:`~streamsx.ec.max_channels` &
+        :py:func:`~streamsx.ec.local_max_channels`
+        to adapt to being invoked in parallel. For example a
+        source callable can use its channel number to determine
+        which partition to read from in a partitioned external system.
+
+        Calling ``set_parallel`` on a stream created by
+        :py:meth:`~Topology.subscribe` results in the stream
+        having `width` channels. Subscribe ensures that the
+        stream will contain all published tuples matching the
+        topic subscription and type. A published tuple will appear
+        on one of the channels though the specific channel is not known
+        in advance.
+
+        A parallel region is terminated by :py:meth:`end_parallel`
+        or :py:meth:`for_each`.
+
+        The number of channels is set by `width` which may be an `int` greater
+        than zero or a submission parameter created by
+        :py:meth:`Topology.create_submission_parameter`.
+
+        With IBM Streams 4.3 or later the number of channels can be
+        dynamically changed at runtime.
+
+        Parallel regions are started on non-source streams using
+        :py:meth:`parallel`.
+
         Args:
             width: The degree of parallelism for the parallel region.
             name(str): Name of the parallel region. Defaults to the name of this stream.
 
         Returns:
             Stream: Returns this stream.
+
+        .. seealso:: :py:meth:`parallel`, :py:meth:`end_parallel`
 
         .. versionadded:: 1.9
         .. versionchanged:: 1.11 `name` parameter added.
@@ -1298,6 +1463,17 @@ class Stream(_placement._Placement, object):
                 number of tuples or `datetime.timedelta` to define the
                 duration of the window.
 
+        Examples::
+
+            # Create a window against stream s of the last 100 tuples
+            w = s.last(size=100)
+
+        ::
+
+            # Create a window against stream s of tuples
+            # arrived on the stream in the last five minutes
+            w = s.last(size=datetime.timedelta(minutes=5))
+
         Returns:
             Window: Window of the last (most recent) tuples on this stream.
         """
@@ -1316,26 +1492,46 @@ class Stream(_placement._Placement, object):
 
         The number of tuples in the batch is defined by `size`.
 
-        If `size` is an `int` then it is the count of tuples in the batch.
-        For example, with ``size=10`` the batch will contain ten tuples.
-        Thus processing against the returned :py:class:`Window`,
-        such as :py:meth:`aggregate` will be executed every ten tuples
-        against the last ten tuples on the stream. For example the
-        first three aggregations would be against the first ten tuples
-        on the stream, then the next ten tuples and then the third ten tuples.
+        If `size` is an ``int`` then it is the count of tuples in the batch.
+        For example, with ``size=10`` each batch will nominally
+        contain ten tuples. Thus processing against the returned
+        :py:class:`Window`, such as :py:meth:`~Window.aggregate` will be
+        executed every ten tuples against the last ten tuples on the stream.
+        For example the first three aggregations would be against
+        the first ten tuples on the stream, then the next ten tuples
+        and then the third ten tuples, etc.
 
         If `size` is an `datetime.timedelta` then it is the duration
         of the batch using wallclock time.
         With a `timedelta` representing five minutes
         then the window contains any tuples that arrived in the last
         five minutes.  Thus processing against the returned :py:class:`Window`,
-        such as :py:meth:`aggregate` will be executed every five minutes tuples
+        such as :py:meth:`~Window.aggregate` will be executed every five minutes tuples
         against the batch of tuples arriving in the last five minutes
         on the stream. For example the first three aggregations would be
         against any tuples on the stream in the first five minutes,
         then the next five minutes and then minutes ten to fifteen.
+        A batch can contain no tuples if no tuples arrived on the stream
+        in the defined duration.
 
         Each tuple on the stream appears only in a single batch.
+
+        The number of tuples seen by processing against the
+        returned window may be less than `size` (count or time based)
+        when:
+
+            * the stream is finite, the final batch may contain less tuples than the defined size,
+            * the stream is in a consistent region, drain processing will complete the current batch without waiting for it to batch to reach its nominal size.
+
+        Examples::
+
+            # Create batches against stream s of 100 tuples each
+            w = s.batch(size=100)
+
+        ::
+
+            # Create batches against stream s every five minutes
+            w = s.batch(size=datetime.timedelta(minutes=5))
 
         Args:
             size: The size of each batch, either an `int` to define the
@@ -1447,6 +1643,7 @@ class Stream(_placement._Placement, object):
             Now returns a :py:class:`Sink` instance.
         """
         sl = _SourceLocation(_source_info(), 'publish')
+        schema = streamsx.topology.schema._normalize(schema)
         if schema is not None and self.oport.schema.schema() != schema.schema():
             nc = None
             if schema == streamsx.topology.schema.CommonSchema.Json:
@@ -1594,18 +1791,18 @@ class Stream(_placement._Placement, object):
 
 class View(object):
     """
-    The View class provides access to a continuously updated sampling of data items on a Stream after submission.
-    A view object is produced by the view method, and will access data items from the stream on which it is invoked.
+    The View class provides access to a continuously updated sampling of data items on a :py:class:`Stream` after submission.
+    A view object is produced by :py:meth:`~Stream.view`, and will access data items from the stream on which it is invoked.
 
-    For example, a View object could be created and used as follows:
+    For example, a `View` object could be created and used as follows:
 
         >>> topology = Topology()
-        >>> rands = topology.source(lambda: random.random())
+        >>> rands = topology.source(lambda: iter(random.random, None))
         >>> view = rands.view()       
         >>> submit(ContextTypes.DISTRIBUTED, topology)
         >>> queue = view.start_data_fetch()
         >>> for val in iter(queue.get, None):
-        ... print(val)
+        ...     print(val)
         ...
         0.6527
         0.1963
@@ -1617,36 +1814,85 @@ class View(object):
 
         self._view_object = None
         self._submit_context = None
-        self._streams_connection = None
 
-    def initialize_rest(self):
+    def _initialize_rest(self):
         """Used to initialize the View object on first use.
         """
-        if self._streams_connection is None:
-            if self._submit_context is None:
-                raise ValueError("View has not been created.")
-
-            self._streams_connection = self._submit_context.streams_connection()
+        if self._submit_context is None:
+            raise ValueError("View has not been created.")
+        job = self._submit_context._job_access()
+        self._view_object = job.get_views(name=self.name)[0]
 
     def stop_data_fetch(self):
         """Terminates the background thread fetching stream data items.
         """
-        self._view_object.stop_data_fetch()
+        if self._view_object:
+            self._view_object.stop_data_fetch()
+            self._view_object = None
 
     def start_data_fetch(self):
         """Starts a background thread which begins accessing data from the remote Stream.
         The data items are placed asynchronously in a queue, which is returned from this method.
 
         Returns:
-            A Queue object which is populated with the data items of the stream.
+            queue.Queue: A Queue object which is populated with the data items of the stream.
         """
-        self.initialize_rest()
-        sc = self._streams_connection
-        instance = sc.get_instance(id=self._submit_context.submission_results['instanceId'])
-        job = instance.get_job(id=self._submit_context.submission_results['jobId'])
-        self._view_object = job.get_views(name=self.name)[0]
-
+        self._initialize_rest()
         return self._view_object.start_data_fetch()
+
+    def fetch_tuples(self, max_tuples=20, timeout=None):
+        """
+        Fetch a number of tuples from this view.
+
+        Fetching of data must have been started with
+        :py:meth:`start_data_fetch` before calling this method.
+
+        If ``timeout`` is ``None`` then the returned list will
+        contain ``max_tuples`` tuples. Otherwise if the timeout is reached
+        the list may contain less than ``max_tuples`` tuples.
+
+        Args:
+            max_tuples(int): Maximum number of tuples to fetch.
+            timeout(float): Maximum time to wait for ``max_tuples`` tuples.
+
+        Returns:
+            list: List of fetched tuples.
+        .. versionadded:: 1.12
+        """
+        return self._view_object.fetch_tuples(max_tuples, timeout)
+
+    def display(self, duration=None, period=2):
+        """Display a view within a Jupyter or IPython notebook.
+
+        Provides an easy mechanism to visualize data on a stream
+        using a view.
+
+        Tuples are fetched from the view and displayed in a table
+        within the notebook cell using a ``pandas.DataFrame``.
+        The table is continually updated with the latest tuples from the view.
+
+        This method calls :py:meth:`start_data_fetch` and will call
+        :py:meth:`stop_data_fetch` when completed if `duration` is set.
+
+        Args:
+            duration(float): Number of seconds to fetch and display tuples. If ``None`` then the display will be updated until :py:meth:`stop_data_fetch` is called.
+            period(float): Maximum update period.
+
+        .. note::
+            A view is a sampling of data on a stream so tuples that
+            are on the stream may not appear in the view.
+
+        .. note::
+            Python modules `ipywidgets` and `pandas` must be installed
+            in the notebook environment.
+
+        .. warning::
+            Behavior when called outside a notebook is undefined.
+
+        .. versionadded:: 1.12
+        """
+        self._initialize_rest()
+        return self._view_object.display(duration, period)
 
 
 class PendingStream(object):
@@ -1820,7 +2066,6 @@ class Window(object):
         Returns: 
             Stream: A `Stream` of the returned values of the supplied function.
 
-        
         .. warning::
             In Python 3.5 or later if the stream being aggregated has a
             structured schema that contains a ``blob`` type then any ``blob``

@@ -6,6 +6,7 @@ from __future__ import unicode_literals
 from future.builtins import *
 from past.builtins import basestring
 
+import os
 import sys
 import uuid
 import json
@@ -14,11 +15,7 @@ import datetime
 import pickle
 from enum import Enum
 
-try:
-    import dill
-    dill.settings['recurse'] = True
-except ImportError:
-    dill = pickle
+import dill
 
 import types
 import base64
@@ -26,9 +23,9 @@ import re
 import streamsx.topology.dependency
 import streamsx.topology.functions
 import streamsx.topology.param
+import streamsx.topology.state
 import streamsx.spl.op
-from streamsx.topology.schema import CommonSchema, StreamSchema
-from streamsx.topology.schema import _stream_schema
+from streamsx.topology.schema import CommonSchema, StreamSchema, _normalize
 
 
 def _fix_namespace(ns):
@@ -49,11 +46,18 @@ def _as_spl_expr(value):
     """ Return value converted to an SPL expression if
     needed other otherwise value.
     """
+    import streamsx._streams._numpy
+
     if hasattr(value, 'spl_json'):
         return value
       
     if isinstance(value, Enum):
         value = streamsx.spl.op.Expression.expression(value.name)
+
+    npcnv = streamsx._streams._numpy.as_spl_expr(value)
+    if npcnv is not None:
+        return npcnv
+    
     return value
 
 # Return a value suitable for use inthe JSON used to
@@ -98,12 +102,6 @@ class SPLGraph(object):
         _id = self._id_gen
         self._id_gen += 1
         return prefix + str(_id)
-
-    def get_views(self):
-        return self._views
-
-    def add_views(self, view):
-        self._views.append(view)
 
     def _requested_name(self, name, action=None, func=None):
         """Create a unique name for an operator or a stream.
@@ -186,6 +184,7 @@ class SPLGraph(object):
         _graph = {}
         _graph["name"] = self.name
         _graph["namespace"] = self.namespace
+        self._add_project_info(_graph)
         _graph["public"] = True
         _graph["config"] = {}
         self._determine_model(_graph["config"])
@@ -218,6 +217,19 @@ class SPLGraph(object):
 
         graph_cfg['model'] = 'spl' if all_spl else 'functional' 
         graph_cfg['language'] = 'spl' if all_spl else 'python'
+
+    def _add_project_info(self, _graph):
+        # Determine if it looks like we are in a project structure
+        # and if so add an @spl__project() annotation
+        project_id = os.environ.get('DSX_PROJECT_ID')
+        if project_id:
+            annotation = {'type':'spl__project', 'properties':{'id':project_id}}
+            project_name = os.environ.get('DSX_PROJECT_NAME')
+            if project_name:
+                annotation['properties']['name'] = project_name
+            if not 'annotations' in _graph:
+                _graph['annotations'] = []
+            _graph['annotations'].append(annotation)
 
     def _add_packages(self, includes):
         for package_path in self.resolver.packages:
@@ -272,7 +284,7 @@ class SPLGraph(object):
 
 class _SPLInvocation(object):
 
-    def __init__(self, index, kind, function, name, params, graph, view_configs = None, sl=None, stateful=None):
+    def __init__(self, index, kind, function, name, params, graph, sl=None, stateful=None):
         self.index = index
         self.kind = kind
         self.model = None
@@ -292,11 +304,7 @@ class _SPLInvocation(object):
         # Arbitrary JSON for operator
         self._op_def = {}
 
-        if view_configs is None:
-            self.view_configs = []
-        else:
-            self.view_configs = view_configs
-
+        self.view_configs = {}
         self.inputPorts = []
         self.outputPorts = []
         self._layout_hints = {}
@@ -330,11 +338,8 @@ class _SPLInvocation(object):
                 for innerParam in param:
                     self.params[param].append(innerParam)
 
-    def getViewConfig(self):
-        return self.view_configs
-
-    def addViewConfig(self, view_configs):
-        self.view_configs.append(view_configs)
+    def addViewConfig(self, view_config):
+        self.view_configs[view_config['name']] = view_config
 
     def addInputPort(self, outputPort=None, window_config=None, alias=None):
         iPortSchema = CommonSchema.Python    
@@ -378,7 +383,7 @@ class _SPLInvocation(object):
         _op["inputs"] = _inputs
         _op["config"] = self.config
         _op["config"]["streamViewability"] = self.viewable
-        _op["config"]["viewConfigs"] = self.view_configs
+        _op["config"]["viewConfigs"] = list(self.view_configs.values())
         if self._placement:
             _op["config"]["placement"] = self._placement
             if 'resourceTags' in self._placement:
@@ -416,7 +421,7 @@ class _SPLInvocation(object):
             _op['consistent'] = {}
             consistent = _op['consistent']
             consistent['trigger'] = self._consistent.trigger.name
-            if self._consistent.trigger == streamsx.topology.consistent.ConsistentRegionConfig.Trigger.PERIODIC:
+            if self._consistent.trigger == streamsx.topology.state.ConsistentRegionConfig.Trigger.PERIODIC:
                 if isinstance(self._consistent.period, datetime.timedelta):
                     consistent_period = self._consistent.period.total_seconds()
                 else:
@@ -453,13 +458,16 @@ class _SPLInvocation(object):
         self.language = 'python'
 
         # Wrap a lambda as a callable class instance
+        recurse = None
         if isinstance(function, types.LambdaType) and function.__name__ == "<lambda>" :
             function = streamsx.topology.runtime._Callable(function, no_context=True)
+            recurse = True
         elif function.__module__ == '__main__':
             # Function/Class defined in main, create a callable wrapping its
             # dill'ed form
             function = streamsx.topology.runtime._Callable(function,
                 no_context = True if inspect.isroutine(function) else None)
+            recurse = True
          
         if inspect.isroutine(function):
             # callable is a function
@@ -468,7 +476,7 @@ class _SPLInvocation(object):
             # callable is a callable class instance
             self.params["pyName"] = function.__class__.__name__
             # dill format is binary; base64 encode so it is json serializable 
-            self.params["pyCallable"] = base64.b64encode(dill.dumps(function)).decode("ascii")
+            self.params["pyCallable"] = base64.b64encode(dill.dumps(function, recurse=recurse)).decode("ascii")
 
         if stateful is not None:
             self.params['pyStateful'] = bool(stateful)
@@ -579,7 +587,7 @@ class OPort(object):
     def __init__(self, name, operator, index, schema, width=None, partitioned_keys=None, routing=None):
         self.name = name
         self.operator = operator
-        self.schema = _stream_schema(schema)
+        self.schema = _normalize(schema)
         self.index = index
         self.width = width
         self.partitioned = partitioned_keys is not None

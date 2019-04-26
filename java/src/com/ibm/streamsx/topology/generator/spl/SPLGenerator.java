@@ -101,6 +101,8 @@ public class SPLGenerator {
         mainCompsiteDef.add("parameters", graph.get("parameters"));
         mainCompsiteDef.addProperty("__spl_mainComposite", true);
         mainCompsiteDef.add("operators", graph.get("operators"));
+        if (graph.has(OpProperties.ANNOTATIONS))
+            mainCompsiteDef.add(OpProperties.ANNOTATIONS, graph.get(OpProperties.ANNOTATIONS));
         composites.add(mainCompsiteDef);
                 
         remapAllCompositePorts();
@@ -787,7 +789,7 @@ public class SPLGenerator {
         if (version == null) {
             version = jstring(graphConfig, CFG_STREAMS_VERSION);
             if (version == null)
-                version = "4.0.1";
+                version = "4.2";
         }
         String[] vrmf = version.split("\\.");
         targetVersion = Integer.valueOf(vrmf[0]);
@@ -807,6 +809,9 @@ public class SPLGenerator {
 
     void generateComposite(JsonObject graphConfig, JsonObject graph,
             StringBuilder compBuilder) throws IOException {
+        
+        
+        OperatorGenerator.genericAnnotations(graph, compBuilder);
         boolean isPublic = jboolean(graph, "public");
         String kind = jstring(graph, KIND);
         kind = getSPLCompatibleName(kind);
@@ -1004,7 +1009,7 @@ public class SPLGenerator {
     private static final int NAME_LEN = 80;
     public static String getSPLCompatibleName(String name) {
 
-        if (name.length() <= NAME_LEN && name.matches("^[a-zA-Z_][a-zA-Z0-9_]+$"))
+        if (name.length() <= NAME_LEN && name.matches("^[a-zA-Z_][a-zA-Z0-9_]*$"))
             return name;
         
         final byte[] original = name.getBytes(StandardCharsets.UTF_8);

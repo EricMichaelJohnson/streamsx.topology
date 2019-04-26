@@ -24,8 +24,6 @@ if sys.version_info.major == 3:
         dill._dill = dill.dill
     dill._dill._reverse_typemap['ClassType'] = type
     
-dill.settings['recurse'] = True
-
 import base64
 import json
 from pkgutil import extend_path
@@ -269,13 +267,7 @@ class _IterableAnyOut(_FunctionalCallable):
     def __call__(self):
         if self._it is None:
             self._start()
-        while True:
-            try:
-                tuple_ = next(self._it)
-                if not tuple_ is None:
-                    return tuple_
-            except StopIteration:
-                return None
+        return next(self._it)
 
 class _IterablePickleOut(_IterableAnyOut):
     def __init__(self, callable_, attributes=None):

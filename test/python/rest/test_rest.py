@@ -46,7 +46,8 @@ class TestDistributedRestFeatures(unittest.TestCase):
     def test_streamsconnection_samplecode(self):
         self.logger.debug("Beginning test: test_streamsconnection_samplecode.")
         domains = self.sc.get_domains()
-        self.assertGreater(len(domains), 0, msg="Should have more than 0 domains.")
+        if domains is not None:
+            self.assertGreater(len(domains), 0, msg="Should have more than 0 domains.")
         instances = self.sc.get_instances()
         self.assertGreater(len(instances), 0, msg="Should have more than 0 instances.")
         jobs_count = 0
@@ -121,8 +122,9 @@ class TestDistributedRestFeatures(unittest.TestCase):
         primitives_caller.check_instance(self, instance)
 
         domain = instance.get_domain()
-        self.assertIsInstance(domain, Domain)
-        primitives_caller.check_domain(self, domain)
+        if domain is not None:
+            self.assertIsInstance(domain, Domain)
+            primitives_caller.check_domain(self, domain)
 
         nops = job.get_operators(name='.*BASIC.$')
         self.assertEqual(2, len(nops))
@@ -239,7 +241,7 @@ class TestSasRestFeatures(TestDistributedRestFeatures):
         self.test_config[ConfigParams.STREAMS_CONNECTION]=self.sc
 
         self.is_v2 = False
-        if _IAMConstants.V2_REST_URL in self.sc.credentials:
+        if _IAMConstants.V2_REST_URL in self.sc.session.auth._credentials:
             self.is_v2 = True
 
     # The underscore in front of this test causes it to be skipped by default

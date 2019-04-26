@@ -28,6 +28,7 @@ import java.util.logging.Logger;
 import javax.net.ssl.SSLContext;
 import javax.xml.bind.DatatypeConverter;
 
+import org.apache.http.Header;
 import org.apache.http.HttpEntity;
 import org.apache.http.HttpResponse;
 import org.apache.http.HttpStatus;
@@ -196,6 +197,7 @@ class StreamsRestUtils {
      */
     static JsonObject getGsonResponse(Executor executor, String auth, String inputString)
             throws IOException {
+        TRACE.fine("HTTP GET: " + inputString);
         Request request = Request.Get(inputString).useExpectContinue();
         
         if (null != auth) {
@@ -245,6 +247,7 @@ class StreamsRestUtils {
      */
     static String getResponseString(Executor executor,
             String auth, String inputString) throws IOException {
+        TRACE.fine("HTTP GET: " + inputString);
         String sReturn = "";
         Request request = Request
                 .Get(inputString)
@@ -264,8 +267,8 @@ class StreamsRestUtils {
             // with a 404 message, we are likely to have a message from Streams
             // but if not, provide a better message
             sReturn = EntityUtils.toString(hResponse.getEntity());
-            if ((sReturn != null) && (!sReturn.equals(""))) {
-                throw RESTException.create(rcResponse, sReturn);
+            if (sReturn != null && !sReturn.isEmpty()) {
+                throw RESTException.create(rcResponse, sReturn + " for url " + inputString);
             } else {
                 String httpError = "HttpStatus is " + rcResponse + " for url " + inputString;
                 throw new RESTException(rcResponse, httpError);
@@ -279,12 +282,18 @@ class StreamsRestUtils {
         return sReturn;
     }
     
-    static InputStream rawStreamingGet(Executor executor,
+    private static InputStream rawStreamingGet(Executor executor,
             String auth, String url) throws IOException {
+        TRACE.fine("HTTP GET: " + url);
+        String accepted =
+                ContentType.APPLICATION_OCTET_STREAM.getMimeType()
+                + ","
+                + "application/x-compressed";
         Request request = Request
                 .Get(url)
-                .addHeader("accept", ContentType.APPLICATION_JSON.getMimeType())
+                .addHeader("accept",accepted)
                 .useExpectContinue();
+        
         if (null != auth) {
             request = request.addHeader(AUTH.WWW_AUTH_RESP, auth);
         }
@@ -453,24 +462,16 @@ class StreamsRestUtils {
      * @return The IAM token URL.
      */
     static String getTokenUrl(JsonObject credentials) {
-        // Default to the well-known Bluemix URL
-        String iamUrl = "https://iam.bluemix.net/oidc/token";
-        // If the REST URL looks like a staging server, construct an IAM URL
-        // in the expected place, eg https://iam.stage1.bluemix.net/oidc/token
-        // If anything goes wrong, we get the default.
+        // Default to the IBM Cloud production URL
+        String iamUrl = "https://iam.cloud.ibm.com/oidc/token";
         if (credentials.has(MEMBER_V2_REST_URL)) {
             try {
                 URL restUrl = new URL(jstring(credentials, MEMBER_V2_REST_URL));
                 String host = restUrl.getHost();
-                int start = host.indexOf(".stage");
-                if (-1 != start) {
-                    String stage = host.substring(start + 1);
-                    int end = stage.indexOf('.');
-                    if (-1 != end) {
-                        iamUrl = "https://iam." + stage.substring(0, end)
-                                + ".bluemix.net/oidc/token";
-                    }
-                }
+                
+                // See if it's a test or staging environment.
+                if (host.endsWith(".test.cloud.ibm.com") || host.matches(".*\\.stage1.*\\.bluemix\\.net"))
+                    iamUrl = "https://iam.test.cloud.ibm.com/oidc/token";              
             } catch (MalformedURLException ignored) {}
         }
         return iamUrl;

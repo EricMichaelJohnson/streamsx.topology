@@ -1,6 +1,6 @@
 # coding=utf-8
 # Licensed Materials - Property of IBM
-# Copyright IBM Corp. 2015,2017
+# Copyright IBM Corp. 2015,2019
 """
 SPL Python primitive operators.
 
@@ -14,9 +14,6 @@ class methods are created by decorators provided by this module.
 The name of the function or callable class becomes the name of the
 operator.
 
-Once created the operators become part of a toolkit and may be used
-like any other SPL operator.
-
 A decorated function is a stateless operator while a decorated class
 is an optionally stateful operator.
 
@@ -27,6 +24,26 @@ These are the supported decorators that create an SPL operator:
     * :py:class:`@spl.map <map>` - Creates a operator that maps input tuples to output tuples.
     * :py:class:`@spl.for_each <for_each>` - Creates a operator that terminates a stream processing each tuple.
     * :py:class:`@spl.primitive_operator <primitive_operator>` - Creates an SPL primitive operator that has an arbitrary number of input and output ports.
+
+Decorated functions and classes must be located in the directory
+``opt/python/streams`` in the SPL toolkit. Each module in that directory
+will be inspected for operators during extraction. Each module defines
+the SPL namespace for its operators by the function ``spl_namespace``,
+for example::
+
+    from streamsx.spl import spl
+
+    def spl_namespace():
+        return 'com.example.ops'
+
+    @spl.map()
+    def Pass(*tuple_):
+        return tuple_
+
+creates a pass-through operator ``com.example.ops::Pass``.
+
+SPL primitive operators are created by executing the extraction script :ref:`spl-py-extract` against the SPL toolkit. Once created the operators become part
+of the toolkit and may be used like any other SPL operator.
 
 *******************************
 Python classes as SPL operators
@@ -105,9 +122,9 @@ Operator state
 Use of a class allows the operator to be stateful by maintaining state in instance
 attributes across invocations (tuple processing).
 
-.. note::
-    For future compatibility instances of a class should ensure that the object's
-    state can be pickled. See https://docs.python.org/3.5/library/pickle.html#handling-stateful-objects
+When the operator is in a consistent region or checkpointing then it is serialized using `dill`. The default serialization may be modified by using the standard Python pickle mechanism of ``__getstate__`` and ``__setstate__``. This is required if the state includes objects that cannot be serialized, for example file descriptors. For details see See https://docs.python.org/3.5/library/pickle.html#handling-stateful-objects .
+
+If the class has ``__enter__`` and ``__exit__`` context manager methods then ``__enter__`` is called after the instance has been deserialized by `dill`. Thus ``__enter__`` is used to recreate runtime objects that cannot be serialized such as open files or sockets.
 
 Operator initialization & shutdown
 ==================================
@@ -569,6 +586,10 @@ import sys
 import streamsx.ec as ec
 import streamsx._streams._runtime
 import importlib
+import warnings
+
+import streamsx._streams._version
+__version__ = streamsx._streams._version.__version__
 
 ############################################
 # setup for function inspection
@@ -609,6 +630,37 @@ def _valid_op_parameter(name):
     if name in ['suppress', 'include']:
         raise ValueError("Parameter name {0} is reserved".format(name))
 
+_EXTRACTING=False
+
+def extracting():
+    """Is a module being loaded by ``spl-python-extract``.
+
+    This can be used by modules defining SPL primitive operators
+    using decorators such as :py:class:`@spl.map <map>`, to avoid
+    runtime behavior. Typically not importing modules that are
+    not available locally. The extraction script loads the module
+    to determine method signatures and thus does not invoke any methods.
+
+    For example if an SPL toolkit with primitive operators requires
+    a package ``extras`` and is using ``opt/python/streams/requirements.txt``
+    to include it, then loading it at extraction time can be avoided by::
+
+        from streamsx.spl import spl
+
+        def spl_namespace():
+            return 'myns.extras'
+
+        if not spl.extracting():
+            import extras
+
+        @spl.map():
+        def myextras(*tuple_):
+            return extras.process(tuple_)
+ 
+    .. versionadded:: 1.11
+    """
+    return _EXTRACTING
+
 def pipe(wrapped):
     """
     Decorator to create an SPL operator from a function.
@@ -628,6 +680,7 @@ def pipe(wrapped):
     """
     if not inspect.isfunction(wrapped):
         raise TypeError('A function is required')
+    warnings.warn("Use @spl.map()", DeprecationWarning, stacklevel=2)
 
     return _wrapforsplop(_OperatorType.Pipe, wrapped, 'position', False)
 
@@ -780,6 +833,9 @@ def _define_fixed(wrapped, callable_):
     is_class = inspect.isclass(wrapped)
     style = callable_._splpy_style if hasattr(callable_, '_splpy_style') else wrapped._splpy_style
 
+    if style == 'dictionary':
+        return -1
+
     fixed_count = 0
     if style == 'tuple':
         sig = _inspect.signature(callable_)
@@ -821,8 +877,8 @@ class source(object):
     see :ref:`submit-from-python`.
     
     If the iteration completes then no more tuples
-    are submitted and a final punctuation mark
-    is submitted to the output port.
+    are submitted and a window punctuation mark followed
+    by final punctuation mark are submitted to the output port.
 
     Example definition::
 
@@ -842,6 +898,16 @@ class source(object):
                 stop: 100;
         }
 
+    If ``__iter__`` or ``__next__`` block then shutdown, checkpointing
+    or consistent region processing may be delayed. Having ``__next__``
+    return ``None`` (no available tuples) or tuples to submit
+    will allow such processing to proceed.
+
+    A shutdown ``threading.Event`` is available through
+    :py:func:`streamsx.ec.shutdown` which becomes set when a shutdown
+    of the processing element has been requested. This event my be waited
+    on to perform a sleep that will terminate upon shutdown.
+    
     Args:
        docpy: Copy Python docstrings into SPL operator model for SPLDOC.
 
@@ -870,7 +936,18 @@ class source(object):
         self.docpy = docpy
     
     def __call__(self, wrapped):
-        return _wrapforsplop(_OperatorType.Source, wrapped, self.style, self.docpy)
+        decorated = _wrapforsplop(_OperatorType.Source, wrapped, self.style, self.docpy)
+        if inspect.isclass(decorated):
+            decorated._splpy_decor = str(self)
+        return decorated
+
+    def __str__(self):
+        s = ''
+        if not self.docpy:
+            if s:
+                 s += ', '
+            s += 'docpy=False'
+        return '@spl.source(' + s + ')'
 
 class map(object):
     """
@@ -922,7 +999,20 @@ class map(object):
         self.docpy = docpy
     
     def __call__(self, wrapped):
-        return _wrapforsplop(_OperatorType.Pipe, wrapped, self.style, self.docpy)
+        decorated =  _wrapforsplop(_OperatorType.Pipe, wrapped, self.style, self.docpy)
+        if inspect.isclass(decorated):
+            decorated._splpy_decor = str(self)
+        return decorated
+
+    def __str__(self):
+        s = ''
+        if self.style is not None:
+            s += 'style=' + str(self.style)
+        if not self.docpy:
+            if s:
+                 s += ', '
+            s += 'docpy=False'
+        return '@spl.map(' + s + ')'
 
 class filter(object):
     """
@@ -976,7 +1066,20 @@ class filter(object):
         self.docpy = docpy
     
     def __call__(self, wrapped):
-        return _wrapforsplop(_OperatorType.Filter, wrapped, self.style, self.docpy)
+        decorated =  _wrapforsplop(_OperatorType.Filter, wrapped, self.style, self.docpy)
+        if inspect.isclass(decorated):
+            decorated._splpy_decor = str(self)
+        return decorated
+
+    def __str__(self):
+        s = ''
+        if self.style is not None:
+            s += 'style=' + str(self.style)
+        if not self.docpy:
+            if s:
+                 s += ', '
+            s += 'docpy=False'
+        return '@spl.filter(' + s + ')'
 
 def ignore(wrapped):
     """
@@ -1008,6 +1111,7 @@ def sink(wrapped):
     """
     if not inspect.isfunction(wrapped):
         raise TypeError('A function is required')
+    warnings.warn("Use @spl.for_each()", DeprecationWarning, stacklevel=2)
 
     return _wrapforsplop(_OperatorType.Sink, wrapped, 'position', False)
 
@@ -1046,7 +1150,20 @@ class for_each(object):
         self.docpy = docpy
 
     def __call__(self, wrapped):
-        return _wrapforsplop(_OperatorType.Sink, wrapped, self.style, self.docpy)
+        decorated = _wrapforsplop(_OperatorType.Sink, wrapped, self.style, self.docpy)
+        if inspect.isclass(decorated):
+            decorated._splpy_decor = str(self)
+        return decorated
+
+    def __str__(self):
+        s = ''
+        if self.style is not None:
+            s += 'style=' + str(self.style)
+        if not self.docpy:
+            if s:
+                 s += ', '
+            s += 'docpy=False'
+        return '@spl.for_each(' + s + ')'
 
 class PrimitiveOperator(object):
     """Primitive operator super class.
@@ -1260,5 +1377,16 @@ class primitive_operator(object):
             for i in range(len(self._output_ports)):
                 cls._splpy_output_ports[self._output_ports[i]] = i
 
+        cls._splpy_decor = str(self)
         return cls
 
+    def __str__(self):
+        s = ''
+        if self._output_ports:
+            s += 'output_ports=' + str(self._output_ports)
+             
+        if not self._docpy:
+            if s:
+                 s += ', '
+            s += 'docpy=False'
+        return '@spl.primitive(' + s + ')'

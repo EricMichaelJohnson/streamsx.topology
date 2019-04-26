@@ -4,12 +4,17 @@
  */
 package com.ibm.streamsx.topology;
 
+import static com.ibm.streamsx.topology.generator.operator.OpProperties.LANGUAGE;
+import static com.ibm.streamsx.topology.generator.operator.OpProperties.LANGUAGE_JAVA;
+import static com.ibm.streamsx.topology.generator.operator.OpProperties.LANGUAGE_SCALA;
 import static com.ibm.streamsx.topology.internal.core.InternalProperties.SPL_PREFIX;
 import static com.ibm.streamsx.topology.internal.core.TypeDiscoverer.getTupleName;
 import static com.ibm.streamsx.topology.spi.builder.Invoker.invokeSource;
 import static java.util.Objects.requireNonNull;
 
 import java.io.File;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
 import java.lang.reflect.Type;
 import java.util.Arrays;
 import java.util.Collections;
@@ -43,11 +48,11 @@ import com.ibm.streamsx.topology.internal.logic.EndlessSupplier;
 import com.ibm.streamsx.topology.internal.logic.LimitedSupplier;
 import com.ibm.streamsx.topology.internal.logic.LogicUtils;
 import com.ibm.streamsx.topology.internal.logic.SingleToIterableSupplier;
+import com.ibm.streamsx.topology.internal.messages.Messages;
 import com.ibm.streamsx.topology.internal.tester.ConditionTesterImpl;
 import com.ibm.streamsx.topology.json.JSONSchemas;
 import com.ibm.streamsx.topology.spi.builder.LayoutInfo;
 import com.ibm.streamsx.topology.tester.Tester;
-import com.ibm.streamsx.topology.internal.messages.Messages;
 
 /**
  * A declaration of a topology of streaming data.
@@ -109,7 +114,7 @@ public class Topology implements TopologyElement {
         name = defaultNames[1];
         builder = new GraphBuilder(namespace, name);
         
-        checkForScala();
+        checkForScala(defaultNames);
     }
     
     /**
@@ -124,7 +129,7 @@ public class Topology implements TopologyElement {
         dependencyResolver = new DependencyResolver(this);
         builder = new GraphBuilder(namespace, name);
         
-        checkForScala();
+        checkForScala(defaultNames);
     }
     
     /**
@@ -141,14 +146,14 @@ public class Topology implements TopologyElement {
         dependencyResolver = new DependencyResolver(this);
         builder = new GraphBuilder(namespace, name);
         
-        checkForScala();        
+        checkForScala(defaultNamespaceName(false));        
     }
     
     /**
      * If Scala is in the class path then automatically
      * add the Scala library to the bundle.
      */
-    private void checkForScala() {
+    private void checkForScala(String[] defaultNames) {
         try {
             Class<?> csf = Class.forName("scala.Function");
             if (csf.getProtectionDomain().getCodeSource() != null)
@@ -164,6 +169,26 @@ public class Topology implements TopologyElement {
             
         } catch (ClassNotFoundException e) {
             // not using Scala!
+        }
+        
+        // Name of source file declaring the topology.
+        String fileName = defaultNames[2];
+        if (fileName != null && fileName.endsWith(".scala")) {
+            builder.getConfig().addProperty(LANGUAGE, LANGUAGE_SCALA);
+
+            String originator = "topology:" + LANGUAGE_SCALA;
+            String version = null;
+            Class<?> sup;
+            try {
+                sup = Class.forName("scala.util.Properties");
+                Method m = sup.getMethod("versionNumberString");
+                version = m.invoke(null).toString();
+            } catch (ClassNotFoundException | NoSuchMethodException | SecurityException | IllegalAccessException
+                    | IllegalArgumentException | InvocationTargetException e) {
+            }
+            if (version != null)
+                originator += "-" + version;
+            builder.setOriginator(originator);
         }
     }
 
@@ -773,16 +798,18 @@ public class Topology implements TopologyElement {
      * Determine the default name and package namespace
      */
     private String[] defaultNamespaceName(boolean withName) {
-        String[] names = new String[2];
+        String[] names = new String[3];
         StackTraceElement[] stack = Thread.currentThread().getStackTrace();
         
         String packageName = null;
         String topologyName = null;
+        String fileName = null;
         for (int i = 0; i < stack.length; i++) {
             StackTraceElement ste = stack[i];
             if (ste.getClassName().equals(Topology.class.getName())) {
                 if (i + 2 < stack.length) {
                     StackTraceElement caller = stack[i + 2];
+                    fileName = caller.getFileName();
                     String className = caller.getClassName();
                     if (withName) {
                         topologyName = caller.getMethodName();
@@ -812,6 +839,7 @@ public class Topology implements TopologyElement {
         
         names[0] = packageName;
         names[1] = topologyName;
+        names[2] = fileName;
 
         return names;
     }

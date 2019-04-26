@@ -29,9 +29,9 @@ See :py:mod:`~streamsx.topology`
 
    streamsx.topology
    streamsx.topology.topology
-   streamsx.topology.consistent
    streamsx.topology.context
    streamsx.topology.schema
+   streamsx.topology.state
    streamsx.topology.tester
    streamsx.topology.tester_runtime
    streamsx.ec
@@ -84,6 +84,7 @@ The `streamsx` package provides a number of command line scripts.
 
    scripts/runner.rst
    scripts/service.rst
+   scripts/info.rst
    scripts/extract.rst
 
 ************

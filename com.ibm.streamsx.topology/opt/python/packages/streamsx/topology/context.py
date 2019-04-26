@@ -1,6 +1,6 @@
 # coding=utf-8
 # Licensed Materials - Property of IBM
-# Copyright IBM Corp. 2015,2017
+# Copyright IBM Corp. 2015,2019
 """
 
 Context for submission of applications.
@@ -26,11 +26,11 @@ except (ImportError, NameError):
     pass
 from future.builtins import *
 
-from streamsx import rest, rest_primitives
 import logging
 import os
 import os.path
 import json
+import platform
 import subprocess
 import threading
 import sys
@@ -38,8 +38,14 @@ import codecs
 import tempfile
 import copy
 import time
+import warnings
 
-logger = logging.getLogger('streamsx.topology.context')
+import streamsx.rest
+import streamsx.rest_primitives
+import streamsx._streams._version
+__version__ = streamsx._streams._version.__version__
+
+logger = logging.getLogger(__name__)
 
 #
 # Submission of a python graph using the Java Application API
@@ -72,13 +78,18 @@ def submit(ctxtype, graph, config=None, username=None, password=None):
         SubmissionResult: Result of the submission. For details of what is contained see the :py:class:`ContextTypes`
         constant passed as `ctxtype`.
     """
+    streamsx._streams._version._mismatch_check(__name__)
     graph = graph.graph
 
     if not graph.operators:
         raise ValueError("Topology {0} does not contain any streams.".format(graph.topology.name))
+    if ctxtype == ContextTypes.STANDALONE_BUNDLE:
+        warnings.warn("Use ContextTypes.BUNDLE", DeprecationWarning, stacklevel=2)
 
     context_submitter = _SubmitContextFactory(graph, config, username, password).get_submit_context(ctxtype)
-    return SubmissionResult(context_submitter.submit())
+    sr = SubmissionResult(context_submitter.submit())
+    sr._submitter = context_submitter
+    return sr
 
 
 
@@ -94,6 +105,8 @@ class _BaseSubmitter(object):
             # the callers config
             self.config.update(config)
         self.config['contextType'] = str(self.ctxtype)
+        if 'originator' not in self.config:
+            self.config['originator'] = 'topology-' + __version__ + ':python-' + platform.python_version()
         self.graph = graph
         self.fn = None
         self.results_file = None
@@ -120,6 +133,7 @@ class _BaseSubmitter(object):
 
         cp = os.path.join(tk_root, "lib", "com.ibm.streamsx.topology.jar")
 
+        remote_context = False
         streams_install = os.environ.get('STREAMS_INSTALL')
         # If there is no streams install, get java from JAVA_HOME and use the remote contexts.
         if streams_install is None:
@@ -128,22 +142,56 @@ class _BaseSubmitter(object):
                 raise ValueError("JAVA_HOME not found. Please set the JAVA_HOME system variable")
 
             jvm = os.path.join(java_home, "bin", "java")
-            submit_class = "com.ibm.streamsx.topology.context.remote.RemoteContextSubmit"
+            remote_context = True
         # Otherwise, use the Java version from the streams install
         else:
             jvm = os.path.join(streams_install, "java", "jre", "bin", "java")
             if ConfigParams.FORCE_REMOTE_BUILD in self.config and self.config[ConfigParams.FORCE_REMOTE_BUILD]:
-                submit_class = "com.ibm.streamsx.topology.context.remote.RemoteContextSubmit"
-            else:
-                submit_class = "com.ibm.streamsx.topology.context.local.StreamsContextSubmit"
+                remote_context = True
             cp = cp + ':' + os.path.join(streams_install, "lib", "com.ibm.streams.operator.samples.jar")
 
-        args = [jvm, '-classpath', cp, submit_class, self.ctxtype, self.fn]
+        progress_fn = lambda _ : None
+        if remote_context:
+            submit_class = "com.ibm.streamsx.topology.context.remote.RemoteContextSubmit"
+            try:
+                get_ipython()
+                import ipywidgets as widgets
+                progress_bar = widgets.IntProgress(
+                    value=0,
+                    min=0, max=10, step=1,
+                    description='Initializing',
+                    bar_style='info', orientation='horizontal',
+                    style={'description_width':'initial'})
+                try:
+                    display(progress_bar)
+                    def _show_progress(msg):
+                        if msg is True:
+                            progress_bar.value = progress_bar.max
+                            progress_bar.bar_style = 'success'
+                            return
+                        if msg is False:
+                            progress_bar.bar_style = 'danger'
+                            return
+                        msg = msg.split('-')
+                        progress_bar.value += 1
+                        progress_bar.description = msg[3]
+                    progress_fn = _show_progress
+                except:
+                    pass
+            except:
+                pass
+        else:
+            submit_class = "com.ibm.streamsx.topology.context.local.StreamsContextSubmit"
+
+        jul_cfg = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logging.properties')
+        jul = '-Djava.util.logging.config.file=' + jul_cfg
+
+        args = [jvm, '-classpath', cp, jul, submit_class, self.ctxtype, self.fn, str(logging.getLogger().getEffectiveLevel())]
         logger.info("Generating SPL and submitting application.")
         proc_env = self._get_java_env()
         process = subprocess.Popen(args, stdin=None, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0, env=proc_env)
 
-        stderr_thread = threading.Thread(target=_print_process_stderr, args=([process, self]))
+        stderr_thread = threading.Thread(target=_print_process_stderr, args=([process, self, progress_fn]))
         stderr_thread.daemon = True
         stderr_thread.start()
 
@@ -159,15 +207,21 @@ class _BaseSubmitter(object):
             with open(self.results_file) as _file:
                 try:
                     results_json = json.loads(_file.read())
+                    progress_fn(True)
                 except IOError:
                     logger.error("Could not read file:" + str(_file.name))
+                    progress_fn(False)
                     raise
                 except json.JSONDecodeError:
                     logger.error("Could not parse results file:" + str(_file.name))
+                    progress_fn(False)
                     raise
                 except:
                     logger.error("Unknown error while processing results file.")
+                    progress_fn(False)
                     raise
+        else:
+            progress_fn(False)
 
         _delete_json(self)
         results_json['return_code'] = process.returncode
@@ -214,7 +268,8 @@ class _BaseSubmitter(object):
         self.results_file = _file.name
         logger.debug("Results file created at " + _file.name)
 
-        self.config[ConfigParams.STREAMS_CONNECTION] = sc
+        if sc is not None:
+            self.config[ConfigParams.STREAMS_CONNECTION] = sc
         return fj
 
     def _create_json_file(self, fj):
@@ -230,9 +285,9 @@ class _BaseSubmitter(object):
 
     def _setup_views(self):
         # Link each view back to this context.
-        if self.graph.get_views():
-            for view in self.graph.get_views():
-                view._submit_context = self
+        for view in self.graph._views:
+            view.stop_data_fetch()
+            view._submit_context = self
 
     def streams_connection(self):
         raise NotImplementedError("Views require submission to DISTRIBUTED or ANALYTICS_SERVICE context")
@@ -301,7 +356,7 @@ class _StreamingAnalyticsSubmitter(_BaseSubmitter):
         self._service_name = self._config().get(ConfigParams.SERVICE_NAME)
 
         if self._streams_connection is not None:
-            if not isinstance(self._streams_connection, rest.StreamingAnalyticsConnection):
+            if not isinstance(self._streams_connection, streamsx.rest.StreamingAnalyticsConnection):
                 raise ValueError("config must contain a StreamingAnalyticsConnection object when submitting to "
                                  "{} context".format(ctxtype))
 
@@ -319,6 +374,7 @@ class _StreamingAnalyticsSubmitter(_BaseSubmitter):
         self._config().pop(ConfigParams.SERVICE_DEFINITION, None)
 
         self._setup_views()
+        self._job = None
 
     def _create_full_json(self):
         fj = super(_StreamingAnalyticsSubmitter, self)._create_full_json()
@@ -329,21 +385,24 @@ class _StreamingAnalyticsSubmitter(_BaseSubmitter):
                 fj['deploy']['serviceRunningTime'] = rts[sn]
         return fj
 
-    def streams_connection(self):
+    def _job_access(self):
+        if self._job:
+            return self._job
         if self._streams_connection is None:
-            self._streams_connection = rest.StreamingAnalyticsConnection(self._vcap_services, self._service_name)
-        return self._streams_connection
+            self._streams_connection = streamsx.rest.StreamingAnalyticsConnection(self._vcap_services, self._service_name)
+        self._job = self._streams_connection.get_instances()[0].get_job(
+                id=self.submission_results['jobId'])
+        return self._job
 
     def _augment_submission_result(self, submission_result):
-        vcap = rest._get_vcap_services(self._vcap_services)
-        credentials = rest._get_credentials(vcap, self._service_name)
+        vcap = streamsx.rest._get_vcap_services(self._vcap_services)
+        credentials = streamsx.rest._get_credentials(vcap, self._service_name)
         
-        if rest_primitives._IAMConstants.V2_REST_URL in credentials:
-            instance_id = credentials[rest_primitives._IAMConstants.V2_REST_URL].split('streaming_analytics/', 1)[1]
+        if streamsx.rest_primitives._IAMConstants.V2_REST_URL in credentials:
+            instance_id = credentials[streamsx.rest_primitives._IAMConstants.V2_REST_URL].split('streaming_analytics/', 1)[1]
         else:
             instance_id = credentials['jobs_path'].split('/service_instances/', 1)[1].split('/', 1)[0]
         submission_result['instanceId'] = instance_id
-        submission_result['streamsConnection'] = self.streams_connection()
         if 'jobId' in submission_result:
             if not hasattr(_StreamingAnalyticsSubmitter._SERVICE_ACTIVE, 'running'):
                 _StreamingAnalyticsSubmitter._SERVICE_ACTIVE.running = dict()
@@ -353,7 +412,7 @@ class _StreamingAnalyticsSubmitter(_BaseSubmitter):
     def _get_java_env(self):
         "Pass the VCAP through the environment to the java submission"
         env = super(_StreamingAnalyticsSubmitter, self)._get_java_env()
-        vcap = rest._get_vcap_services(self._vcap_services)
+        vcap = streamsx.rest._get_vcap_services(self._vcap_services)
         env['VCAP_SERVICES'] = json.dumps(vcap)
         return env
 
@@ -368,31 +427,80 @@ class _DistributedSubmitter(_BaseSubmitter):
         self._streams_connection = config.get(ConfigParams.STREAMS_CONNECTION)
         self.username = username
         self.password = password
+        self._job = None
+
+        if self._streams_connection is not None:
+            pass
+        elif 'STREAMS_DOMAIN_ID' in os.environ and 'STREAMS_INSTANCE_ID' in os.environ:
+            pass
+        else:
+            # Look for a service definition
+            svc_info = streamsx.rest_primitives.Instance._find_service_def(config)
+            if not svc_info:
+                # Look for endpoint set by env vars.
+                inst = streamsx.rest_primitives.Instance.of_endpoint(username=username, password=password, verify=config.get(ConfigParams.SSL_VERIFY))
+                if inst is not None:
+                    self._streams_connection = inst.rest_client._sc
 
         # Verify if credential (if supplied) is consistent with those in StreamsConnection
-        if self._streams_connection is not None:
-            self.username = self._streams_connection.rest_client._username
-            self.password = self._streams_connection.rest_client._password
-            if ((username is not None and username != self.username or
-                 password is not None and password != self.password)):
-                raise RuntimeError('Credentials supplied in the arguments differ than '
+        if self._streams_connection is not None and isinstance(self._streams_connection, streamsx.rest.StreamsConnection):
+            if isinstance(self._streams_connection.session.auth, tuple):
+                self.username = self._streams_connection.session.auth[0]
+                self.password = self._streams_connection.session.auth[1]
+                if ((username is not None and username != self.username) or (password is not None and password != self.password)):
+                        raise RuntimeError('Credentials supplied in the arguments differ than '
                                    'those specified in the StreamsConnection object')
+            elif isinstance(self._streams_connection.session.auth, streamsx.rest_primitives._ICPDExternalAuthHandler):
+                svc_info = self._streams_connection.session.auth._cfg
+                self._config()[ConfigParams.SERVICE_DEFINITION] = svc_info
+                if  self._streams_connection.session.verify == False:
+                    self._config()[ConfigParams.SSL_VERIFY] = False
+        else:
+            svc_info =  streamsx.rest_primitives.Instance._find_service_def(config)
+            if svc_info:
+                self._config()[ConfigParams.SERVICE_DEFINITION] = svc_info
+                streamsx.rest_primitives.Instance._clear_service_info(self._config())
 
         # Give each view in the app the necessary information to connect to SWS.
         self._setup_views()
 
-    def streams_connection(self):
-        if self._streams_connection is None:
-            self._streams_connection = rest.StreamsConnection(self.username, self.password)
-        return self._streams_connection
+    def _job_access(self):
+        if self._job:
+            return self._job
+        sc = self._config().get(ConfigParams.STREAMS_CONNECTION)
+        if not sc:
+            if ConfigParams.SERVICE_DEFINITION in self._config():
+                instance = streamsx.rest_primitives.Instance.of_service(self._config())
+                self._job = instance.get_job(id=self.submission_results['jobId'])
+                return self._job
+            sc = streamsx.rest.StreamsConnection(self.username, self.password)
+            if ConfigParams.SSL_VERIFY in self._config():
+                sc.session.verify = self._config()[ConfigParams.SSL_VERIFY]
 
-    def _augment_submission_result(self, submission_result):
-        submission_result['instanceId'] = os.environ.get('STREAMS_INSTANCE_ID', 'StreamsInstance')
-        # If we have the information to create a StreamsConnection, do it
-        if not ((self.username is None or self.password is None) and
-                        self.config.get(ConfigParams.STREAMS_CONNECTION) is None):
-            submission_result['streamsConnection'] = self.streams_connection()
+        iid = os.environ.get('STREAMS_INSTANCE_ID')
+        if iid:
+            instance = sc.get_instance(id=iid)
+        else:
+            instance = sc.get_instances()[0]
+        self._job = instance.get_job(id=self.submission_results['jobId'])
+        return self._job
 
+    def _get_java_env(self):
+        "Set env vars from connection if set"
+        env = super(_DistributedSubmitter, self)._get_java_env()
+        if self._streams_connection is not None:
+            # Need to sure the environment matches the connection.
+            sc = self._streams_connection
+            if isinstance(sc._delegator, streamsx.rest_primitives._StreamsRestDelegator):
+                 env.pop('STREAMS_DOMAIN_ID', None)
+                 env.pop('STREAMS_INSTANCE_ID', None)
+            else:
+                 env['STREAMS_DOMAIN_ID'] = sc.get_domains()[0].id
+            if not ConfigParams.SERVICE_DEFINITION in self._config():
+                env['STREAMS_REST_URL'] = sc.resource_url
+                env['STREAMS_USERNAME'] = sc.session.auth[0]
+                env['STREAMS_PASSWORD'] = sc.session.auth[1]
+        return env
 
 class _SubmitContextFactory(object):
     """
@@ -415,8 +523,7 @@ class _SubmitContextFactory(object):
         # are supported.
         streams_install = os.environ.get('STREAMS_INSTALL')
         if streams_install is None:
-            if not (ctxtype == ContextTypes.TOOLKIT or ctxtype == ContextTypes.BUILD_ARCHIVE
-                    or ctxtype == ContextTypes.ANALYTICS_SERVICE or ctxtype == ContextTypes.STREAMING_ANALYTICS_SERVICE):
+            if ctxtype == ContextTypes.STANDALONE:
                 raise ValueError(ctxtype + " must be submitted when an IBM Streams install is present.")
 
         if ctxtype == ContextTypes.DISTRIBUTED:
@@ -462,10 +569,20 @@ def _print_process_stdout(process):
     finally:
         process.stdout.close()
 
+_JAVA_LOG_LVL = {
+    # java.util.logging
+    'SEVERE': logging.ERROR,
+    'WARNING': logging.WARNING,
+    'INFO':logging.INFO, 'CONFIG':logging.INFO,
+    'FINE:':logging.DEBUG, 'FINER':logging.DEBUG, 'FINEST':logging.DEBUG,
+    'FATAL': logging.CRITICAL,
+    'ERROR': logging.ERROR,
+    'DEBUG:':logging.DEBUG, 'TRACE':logging.DEBUG
+    }
 
-# Used by a thread which polls a subprocess's stderr and writes it to stderr, until the sc compilation
-# has begun.
-def _print_process_stderr(process, submitter):
+# Used by a thread which polls a subprocess's stderr and writes it to
+# a logger or stderr
+def _print_process_stderr(process, submitter, progress_fn):
     try:
         if sys.version_info.major == 2:
             serr = codecs.getwriter('utf8')(sys.stderr)
@@ -475,11 +592,18 @@ def _print_process_stderr(process, submitter):
                 process.stderr.close()
                 break
             line = line.decode("utf-8").strip()
+            em = line.rstrip().split(': ', 1)
+            if len(em) == 2 and em[0] in _JAVA_LOG_LVL:
+                if 'INFO' == em[0] and em[1].startswith('!!-streamsx-'):
+                    progress_fn(em[1])
+                    continue
+                logger.log(_JAVA_LOG_LVL[em[0]], em[1])
+                continue
             if sys.version_info.major == 2:
                 serr.write(line)
                 serr.write("\n")
             else:
-                print(line)
+                print(line, file=sys.stderr)
     except:
         logger.error("Error reading from Java subprocess stderr stream.")
         raise
@@ -534,9 +658,57 @@ class ContextTypes(object):
     """
     ANALYTICS_SERVICE = 'ANALYTICS_SERVICE'
     """Synonym for :py:const:`STREAMING_ANALYTICS_SERVICE`.
+
+    .. deprecated:: Use :py:const:`STREAMING_ANALYTICS_SERVICE`.
     """
     DISTRIBUTED = 'DISTRIBUTED'
     """Submission to an IBM Streams instance.
+
+    **IBM Cloud Private for Data**
+
+    *Projects (within ICPD cluster)*
+
+    The `Topology` is compiled using the Streams build service and submitted
+    to an IBM Streams service instance running in the same ICP for
+    Data cluster as the Jupyter notebook declaring the application.
+
+    The instance is specified in the configuration passed into :py:func:`submit`. The configuration may be code injected from the list of services or manually created. The code that selects a service instance by name is::
+
+        from icpd_core import ipcd_util
+        cfg = icpd_util.get_service_details(name='instanceName')
+
+    The resultant `cfg` dict may be augmented with other values such as
+    a :py:class:`JobConfig` or keys from :py:class:`ConfigParams`.
+
+    *External to ICPD cluster*
+
+    The `Topology` is compiled using the Streams build service and submitted
+    to an IBM Streams service instance running in an ICP for Data cluster.
+
+    The IBM Streams instance to connect to is defined by the
+    ``STREAMS_REST_URL`` environment variable which is set to
+    the external Streams REST endpoint for the service instance.
+
+    The endpoint is found through the ICPD console in the
+    *Provisioned instances* tab of the *My Instances* page.
+    Click on *View details* for the Streams service and then
+    copy the ``externalRestEndpoint`` and set that as the value
+    of ``STREAMS_REST_URL``.
+
+    .. figure:: images/icpd_external_endpoint.png
+        :scale: 60%
+        :alt: Endpoints with externalRestEndpoint
+
+        Copy ``externalRestEndpoint`` from `Endpoints` section.
+
+    Environment variables:
+        These environment variables define how the application is built and submitted.
+
+        * **STREAMS_REST_URL** - External endpoint for Streams REST API.
+        * **STREAMS_USERNAME** - (optional) User name to submit the job as, defaulting to the current operating system user name.
+        * **STREAMS_PASSWORD** - Password for authentication.
+
+    **IBM Streams on-premise**
 
     The `Topology` is compiled locally and the resultant Streams application bundle
     (sab file) is submitted to an IBM Streams instance.
@@ -544,14 +716,14 @@ class ContextTypes(object):
     Environment variables:
         These environment variables define how the application is built and submitted.
 
-        * **STREAMS_INSTALL** - Location of a IBM Streams installation (4.0.1 or later).
+        * **STREAMS_INSTALL** - Location of a IBM Streams installation (4.2 or later).
         * **STREAMS_DOMAIN_ID** - Domain identifier for the Streams instance.
         * **STREAMS_INSTANCE_ID** - Instance identifier.
         * **STREAMS_ZKCONNECT** - (optional) ZooKeeper connection string for domain (when not using an embedded ZooKeeper)
         * **STREAMS_USERNAME** - (optional) User name to submit the job as, defaulting to the current operating system user name.
 
     .. warning::
-        ``streamtool`` is used to submit the job and requires that ``streamtool`` does not prompt for authentication.  This is achieved by using ``streamtool genkey``.
+        ``streamtool`` is used to submit the job with on-premise 4.2 & 4.3 Streams and requires that ``streamtool`` does not prompt for authentication.  This is achieved by using ``streamtool genkey``.
 
         .. seealso::
             `Generating authentication keys for IBM Streams <https://www.ibm.com/support/knowledgecenter/SSCRJU_4.2.1/com.ibm.streams.cfg.doc/doc/ibminfospherestreams-user-security-authentication-rsa.html>`_
@@ -634,7 +806,7 @@ class ContextTypes(object):
         * **STREAMS_INSTALL** - Location of a IBM Streams installation (4.0.1 or 4.1.x).
 
     .. deprecated:: IBM Streams 4.2
-        Use :py:const:`BUNDLE` when compiling with IBM Streams 4.2 or later.
+        Use :py:const:`BUNDLE`.
     """
 
 
@@ -682,6 +854,17 @@ class ConfigParams(object):
     """
     Key for a :py:class:`StreamsConnection` object for connecting to a running IBM Streams instance.
     """
+    SSL_VERIFY = 'topology.SSLVerify'
+    """
+    Key for the SSL verification value passed to `requests` as its ``verify``
+    option for distributed contexts. By default set to `True`.
+
+    .. note:: Only ``True`` or ``False`` is supported. Behaviour is undefined
+        when passing a path to a CA_BUNDLE file or directory with
+        certificates of trusted CAs.
+
+    .. versionadded:: 1.11
+    """
     SERVICE_DEFINITION = 'topology.service.definition'
     """Streaming Analytics service definition.
     Identifies the Streaming Analytics service to use. The definition can be one of
@@ -692,6 +875,27 @@ class ConfigParams(object):
     This key takes precedence over :py:const:`VCAP_SERVICES` and :py:const:`SERVICE_NAME`.
 
     .. seealso:: :ref:`sas-service-def`
+    """
+
+    SC_OPTIONS = 'topology.sc.options'
+    """
+    Options to be passed to IBM Streams sc command.
+
+    A topology is compiled into a Streams application
+    bundle (`sab`) using the SPL compiler ``sc``.
+
+    Additional options to be passed to ``sc``
+    may be set using this key. The value can be a
+    single string option (e.g. ``--c++std=c++11`` to select C++ 11 compilation)
+    or a list of strings for multiple options.
+
+    Setting ``sc`` options may be required when invoking SPL operators
+    directly or testing SPL applications.
+
+    .. warning::
+        Options that modify the requested submission context (e.g. setting
+        a different main composite) or deprecated options should not be specified.
+    .. versionadded:: 1.12.10
     """
 
 
@@ -1034,22 +1238,74 @@ class SubmissionResult(object):
     Allows the user to use dot notation to access dictionary elements."""
     def __init__(self, results):
         self.results = results
-
+        self._submitter = None
 
     @property
     def job(self):
-        """If able, returns the job associated with the submitted build.
-        If a username/password, StreamsConnection, or vcap file was not supplied,
-        returns None.
+        """REST binding for the job associated with the submitted build.
 
-        *NOTE*: The @property tag supersedes __getattr__. In other words, this job method is
-        called before __getattr__(self, 'job') is called.
+        Returns:
+            Job: REST binding for running job or ``None`` if connection information was not available or no job was submitted.
         """
-        if 'streamsConnection' in self.results:
-            sc = self.streamsConnection
-            inst = sc.get_instance(self.instanceId)
-            return inst.get_job(self.jobId)
+        if self._submitter and hasattr(self._submitter, '_job_access'):
+            return self._submitter._job_access()
         return None
+
+    def cancel_job_button(self, description=None):
+        """Display a button that will cancel the submitted job.
+
+        Used in a Jupyter IPython notebook to provide an interactive
+        mechanism to cancel a job submitted from the notebook.
+
+        Once clicked the button is disabled unless the cancel fails.
+
+        A job may be cancelled directly using::
+
+            submission_result = submit(ctx_type, topology, config)
+            submission_result.job.cancel()
+
+        Args:
+
+            description(str): Text used as the button description, defaults to value based upon the job name.
+
+        .. warning::
+            Behavior when called outside a notebook is undefined.
+
+        .. versionadded:: 1.12
+        """
+        if not hasattr(self, 'jobId'):
+            return
+  
+        try:
+            import ipywidgets as widgets
+            if not description:
+                description = 'Cancel job: '
+                description += self.name if hasattr(self, 'name') else self.job.name
+            button = widgets.Button(description=description,
+                button_style='danger',
+                layout=widgets.Layout(width='40%'))
+            out = widgets.Output()
+            vb = widgets.VBox([button, out])
+            @out.capture(clear_output=True)
+            def _cancel_job_click(b):
+                b.disabled=True
+                print('Cancelling job: id=' + str(self.job.id) + ' ...\n', flush=True)
+                try:
+                    rc = self.job.cancel()
+                    out.clear_output()
+                    if rc:
+                        print('Cancelled job: id=' + str(self.job.id) + ' : ' + self.job.name + '\n', flush=True)
+                    else:
+                        print('Job already cancelled: id=' + str(self.job.id) + ' : ' + self.job.name + '\n', flush=True)
+                except:
+                    b.disabled=False
+                    out.clear_output()
+                    raise
+ 
+            button.on_click(_cancel_job_click)
+            display(vb)
+        except:
+            pass
 
     def __getattr__(self, key):
         if key in self.__getattribute__("results"):

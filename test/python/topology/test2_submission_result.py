@@ -11,8 +11,6 @@ class TestSubmissionResult(unittest.TestCase):
 
     def setUp(self):
         Tester.setup_distributed(self)
-        self.username = os.getenv("STREAMS_USERNAME", "streamsadmin")
-        self.password = os.getenv("STREAMS_PASSWORD", "passw0rd")
 
     def _correct_job_ids(self):
         # Test that result.job exists and you can pull values from it.
@@ -27,15 +25,11 @@ class TestSubmissionResult(unittest.TestCase):
         topo = Topology("job_in_result_test")
         topo.source(["foo"])
 
-        sc = rest.StreamsConnection(username=self.username, password=self.password)
-        sc.session.verify = False
-        config = {ConfigParams.STREAMS_CONNECTION : sc}
-
         tester = Tester(topo)
         self.tester = tester
 
         tester.local_check = self._correct_job_ids
-        tester.test(self.test_ctxtype, config)
+        tester.test(self.test_ctxtype, self.test_config)
 
     def test_fetch_logs_on_failure(self):
         topo = Topology("fetch_logs_on_failure")

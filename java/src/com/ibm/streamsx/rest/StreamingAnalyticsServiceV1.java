@@ -136,7 +136,7 @@ class StreamingAnalyticsServiceV1 extends AbstractStreamingAnalyticsService {
 
     @Override
     protected JsonObject submitBuild(CloseableHttpClient httpclient,
-            File archive, String buildName)
+            File archive, String buildName, String originator/*unused*/)
             throws IOException {
         String newBuildURL = getBuildsUrl(httpclient) + "?build_name=" +
                 URLEncoder.encode(buildName, StandardCharsets.UTF_8.name());
@@ -180,5 +180,10 @@ class StreamingAnalyticsServiceV1 extends AbstractStreamingAnalyticsService {
     @Override
     AbstractStreamingAnalyticsConnection createStreamsConnection() throws IOException {
         return StreamingAnalyticsConnectionV1.of(this, service, false);
+    }
+    
+    @Override
+    protected boolean downloadArtifacts(CloseableHttpClient httpclient, JsonArray artifacts) {
+        return false;
     }
 }

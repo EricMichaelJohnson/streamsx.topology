@@ -75,6 +75,7 @@ public class ZippedToolkitRemoteContext extends ToolkitRemoteContext {
         }
               
         final File toolkitRoot = super._submit(submission).get();
+        report("Building code archive");
         return createCodeArchive(toolkitRoot, submission);
     }
     
@@ -127,10 +128,12 @@ public class ZippedToolkitRemoteContext extends ToolkitRemoteContext {
             if (configSpl != null) {
                 objectArray(configSpl, "toolkits",
                         tk -> {
-                            File tkRoot = new File(jstring(tk, "root"));
-                            String tkRootName = tkRoot.getName();
-                            tkManifest.println(tkRootName);
-                            toolkits.put(tkRoot.toPath(), tkRootName);
+                            if (tk.has("root")) {
+                                File tkRoot = new File(jstring(tk, "root"));
+                                String tkRootName = tkRoot.getName();
+                                tkManifest.println(tkRootName);
+                                toolkits.put(tkRoot.toPath(), tkRootName);
+                            }
                             }
                         );
             }

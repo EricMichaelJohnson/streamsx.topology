@@ -94,6 +94,7 @@ class TestTester(unittest.TestCase):
     def my_local(self):
         self.assertTrue(hasattr(self.tester, 'submission_result'))
         self.assertTrue(hasattr(self.tester, 'streams_connection'))
+        self.assertIs(self.tester.streams_connection, self.tester.submission_result.job.rest_client._sc)
         self.my_local_called = True
 
     def test_bad_pe(self):
@@ -146,6 +147,26 @@ class TestTester(unittest.TestCase):
         tester = Tester(topo)
         tester.tuple_count(s, N)
         tester.eventual_result(a, _EROK(int(N/4)))
+        ok = tester.test(self.test_ctxtype, self.test_config, assert_on_fail=False)
+        self.assertFalse(ok)
+
+    def test_count_bad(self):
+        N=10
+        topo = Topology()
+        s = topo.source(range(N))
+        tester = Tester(topo)
+        tester.tuple_count(s, N+1)
+        ok = tester.test(self.test_ctxtype, self.test_config, assert_on_fail=False)
+        self.assertFalse(ok)
+
+    def test_count_bad_conflicting(self):
+        N=10
+        topo = Topology()
+        s = topo.source(range(N))
+        tester = Tester(topo)
+        # Add one that fails and one that never becomes valid
+        tester.tuple_count(s.map(), int(N/2))
+        tester.tuple_count(s, N+1)
         ok = tester.test(self.test_ctxtype, self.test_config, assert_on_fail=False)
         self.assertFalse(ok)
 

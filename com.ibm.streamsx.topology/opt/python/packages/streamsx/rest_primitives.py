@@ -17,6 +17,7 @@ from future.builtins import *
 
 import logging
 import requests
+import requests.exceptions
 import queue
 import os
 import threading
@@ -28,9 +29,25 @@ import time
 from pprint import pformat
 from urllib import parse
 
+import streamsx.topology.context
 import streamsx.topology.schema
+import streamsx.rest
+
+##############################################################
+# NOTE verify is passed explictly when using session to
+# work around requests defect: #3829
+# https://github.com/requests/requests/issues/3829
+##############################################################
 
 logger = logging.getLogger('streamsx.rest')
+
+def _get_username(username=None):
+    if not username:
+       username = os.environ.get('STREAMS_USERNAME')
+       if not username:
+           import getpass
+           username = getpass.getuser()
+    return username
 
 def _file_name(prefix, id_, suffix):
     return prefix + '_' + id_ + '_' + str(int(time.time())) + suffix
@@ -138,48 +155,58 @@ class _ResourceElement(object):
             return elements[0]
         raise ValueError("Multiple resources matching: {0}".format(id))
 
+def _handle_http_errors(res):
+    # HTTP error responses are 4xx, server errors are 5xx
+    if res.status_code >= 400:
+        #logger.error("Response returned with error code: " + str(res.status_code))
+        #logger.error(res.text)
+        res.raise_for_status()
+
+
 class _StreamsRestClient(object):
+    _blocked_ssl_warn = False
+
     """Session connection with the Streams REST API
     """
-    def __init__(self, username, password):
+    def __init__(self, auth):
+        self.session = requests.Session()
+        self.session.auth = auth
+
+    def _block_ssl_warn(self):
+        if self.session.verify is False and not _StreamsRestClient._blocked_ssl_warn:
+            import warnings
+            import urllib3
+            warnings.simplefilter(action='once', category=urllib3.exceptions.InsecureRequestWarning)
+            _StreamsRestClient._blocked_ssl_warn = True
+
+    # Create session to reuse TCP connection
+    # https authentication
+    @staticmethod
+    def _of_basic(username, password):
         """
         Args:
             username(str): The username of an authorized Streams user.
             password(str): The password associated with the username.
         """
-        # Create session to reuse TCP connection
-        # https authentication
-        self._username = username
-        self._password = password
-
-        self.session = requests.Session()
-        self.session.auth = (username, password)
-        self._auth_token = requests.auth._basic_auth_str(self._username, self._password)
-
-    def _get_authorization(self):
-        return self._auth_token
-
-    def handle_http_errors(self, res):
-        # HTTP error responses are 4xx, server errors are 5xx
-        if res.status_code >= 400:
-            logger.error("Response returned with error code: " + str(res.status_code))
-            logger.error(res.text)
-            res.raise_for_status()
-
+        auth = (username, password)
+        return _StreamsRestClient(auth)
+    
     def make_request(self, url):
         logger.debug('Beginning a REST request to: ' + url)
-        res = self.session.get(url)
-        self.handle_http_errors(res)
+        self._block_ssl_warn()
+        headers={ 'Accept': 'application/json'}
+        res = self.session.get(url, headers=headers, verify=self.session.verify)
+        _handle_http_errors(res)
         return res.json()
 
     def make_raw_streaming_request(self, url, mimetype=None):
         logger.debug('Beginning a REST request to: ' + url)
+        self._block_ssl_warn()
         headers = {}
         if mimetype:
             headers['Accept'] = mimetype
-        res = self.session.get(url, stream=True, headers=headers)
-        self.handle_http_errors(res)
-
+        res = self.session.get(url, stream=True, headers=headers, verify=self.session.verify)
+        _handle_http_errors(res)
         return res
 
     def _retrieve_file(self, url, filename, dir_, mimetype):        
@@ -205,6 +232,157 @@ class _StreamsRestClient(object):
 
     def __str__(self):
         return pformat(self.__dict__)
+
+
+class _BearerAuthHandler(requests.auth.AuthBase):
+    def __init__(self):
+        # Represents the epoch time in milliseconds at which
+        # the token is no longer valid
+        # Starts at -1 such that the first invocation of a REST request
+        # Retrieves a token
+        self._auth_expiry_time = 0
+
+    @property
+    def token(self):
+        return self._bt
+
+    @token.setter
+    def token(self, token):
+        self._bt = 'Bearer ' + token
+
+    def __call__(self, r):
+        # Convert cur time to milliseconds
+        cur_time = time.time()
+        if cur_time >= self._auth_expiry_time:
+            last = self._auth_expiry_time
+            if last == 0:
+                last = time.time()
+            self._refresh_auth()
+        r.headers['Authorization'] = self.token
+        return r
+
+
+class _ICPDAuthHandler(_BearerAuthHandler):
+    def __init__(self, service_name, token):
+        super(_ICPDAuthHandler, self).__init__()
+        self._service_name = service_name
+        if token:
+            try:
+                self._refresh_auth()
+            except:
+                self.token = token
+                self._auth_expiry_time = time.time() + 19*60
+            logger.debug("ICP4D:Token expiry:" + time.ctime(self._auth_expiry_time))
+
+    def _refresh_auth(self):
+        logger.debug("ICP4D:Token refresh:")
+        from icpd_core import icpd_util
+        self.token = icpd_util.get_instance_token(name=self._service_name)
+        self._auth_expiry_time = time.time() + 19*60
+        logger.debug("ICP4D:Token refreshed:expiry:" + time.ctime(self._auth_expiry_time))
+
+class _ICPDExternalAuthHandler(_BearerAuthHandler):
+    def __init__(self, endpoint, username, password):
+        super(_ICPDExternalAuthHandler, self).__init__()
+        self._endpoint = endpoint
+        self.__username = username
+        self.__password = password
+        self._cfg = self._create_cfg()
+
+    def _refresh_auth(self):
+        logger.debug("ICP4DExternal:Token refresh:")
+        self._cfg = self._create_cfg()
+        logger.debug("ICP4DExternal:Token refreshed:expiry:" + time.ctime(self._auth_expiry_time))
+
+    def _create_cfg(self):
+        import requests
+        import urllib.parse as up
+        pd = {'username': self.__username, 'password': self.__password}
+
+        es = up.urlsplit(self._endpoint)
+        cluster_ip = es.netloc.split(':')[0]
+
+        auth_url = up.urlunsplit(('https', cluster_ip + ':31843', '/icp4d-api/v1/authorize', None, None))
+        r = requests.post(auth_url, json=pd, verify=False)
+        token = r.json()['token']
+
+        name = es.path.split('/')[-1]
+
+        details_url = up.urlunsplit(
+            ('https', cluster_ip + ':31843', 'zen-data/v2/serviceInstance/details', 'displayName=' + name, None))
+        r = requests.get(details_url,
+                         headers={"Authorization": "Bearer " + token}, verify=False)
+
+        sr = r.json()
+
+        sro = sr['requestObj']
+
+        service_id = sro['ID']
+        service_type = sro['ServiceInstanceType']
+
+        sca = sro['CreateArguments']
+        service_name = sca['metadata']['instance']['id']
+        connection_info = sca['connection-info']
+
+        service_token_url = up.urlunsplit(
+            ('https', cluster_ip + ':31843', 'zen-data/v2/serviceInstance/token', None, None))
+        pd = {"serviceInstanceId": str(service_id)}
+        r = requests.post(service_token_url, json=pd,
+                          headers={"Authorization": "Bearer " + token}, verify=False)
+
+        service_token = r.json()['AccessToken']
+        self.token = service_token
+        self._auth_expiry_time = time.time() + 19 * 60
+
+        # Convert the external endpoints to use the passed in cluster ip.
+        bu = up.urlsplit(connection_info['externalBuildEndpoint'])
+        build_url = up.urlunsplit((bu.scheme, cluster_ip + ':' + str(bu.port), bu.path, None, None))
+
+        cfg = {
+                'type': 'streams',
+                'connection_info': {
+                    'externalClient':True,
+                    'serviceBuildEndpoint': build_url,
+                    'serviceRestEndpoint': self._endpoint},
+                'service_token': service_token,
+                'cluster_ip': cluster_ip,
+                'service_id': service_id
+        }
+
+        return cfg
+
+class _IAMAuthHandler(_BearerAuthHandler):
+    def __init__(self, credentials):
+        """
+        Args:
+            credentials: The credentials of the Streaming Analytics service.
+        """
+        super(_IAMAuthHandler, self).__init__()
+        self._credentials = credentials
+        self._api_key = self._credentials[_IAMConstants.API_KEY]
+
+        # Determine if service is in production or staging/test
+        v2url = self._credentials[_IAMConstants.V2_REST_URL]
+
+        v2host = parse.urlparse(v2url).hostname
+        if v2host.endswith('test.cloud.ibm.com') or ('stage1' in v2host and v2host.endswith('.bluemix.net')):
+            self._token_url = _IAMConstants.TOKEN_URL_TEST
+        else:
+            self._token_url = _IAMConstants.TOKEN_URL
+
+    def _refresh_auth(self):
+        post_url = self._token_url + '?' + self._get_token_params(self._api_key)
+        res = requests.post(post_url, headers = {'Accept' : 'application/json',
+                                                 'Content-Type' : 'application/x-www-form-urlencoded'})
+        _handle_http_errors(res)
+        res = res.json()
+
+        self._auth_expiry_time = int(res[_IAMConstants.EXPIRATION]) - 30
+        self._bearer_token = self.token = res[_IAMConstants.ACCESS_TOKEN]
+
+    def _get_token_params(self, api_key):
+        return parse.urlencode({_IAMConstants.GRANT_PARAM : _IAMConstants.GRANT_TYPE,
+                                       _IAMConstants.API_KEY : api_key})
 
 
 
@@ -235,66 +413,7 @@ class _IAMStreamsRestClient(_StreamsRestClient):
         Args:
             credentials: The credentials of the Streaming Analytics service.
         """
-        self._credentials = credentials
-        self._api_key = self._credentials[_IAMConstants.API_KEY]
-
-        # Represents the epoch time in milliseconds at which
-        # the token is no longer valid
-        # Starts at -1 such that the first invocation of a REST request
-        # Retrieves a token
-        self._auth_expiry_time = -1
-
-        # Determine if service is in stage1
-        if 'stage1' in  self._credentials[_IAMConstants.V2_REST_URL]:
-            self._token_url = _IAMConstants.TOKEN_URL_STAGE1
-        else:
-            self._token_url = _IAMConstants.TOKEN_URL
-
-        self.session = requests.Session()
-
-    def _get_authorization(self):
-        # Convert cur time to milliseconds
-        cur_time = int(time.time() * 1000)
-        if cur_time >= self._auth_expiry_time:
-            self._refresh_authorization()
-        return self._bearer_token
-
-    def _refresh_authorization(self):
-        post_url = self._token_url + '?' + self._get_token_params(self._api_key)
-        res = requests.post(post_url, headers = {'Accept' : 'application/json',
-                                                 'Content-Type' : 'application/x-www-form-urlencoded'})
-        self.handle_http_errors(res)
-        res = res.json()
-
-        self._auth_expiry_time = int(res[_IAMConstants.EXPIRATION] * 1000) - _IAMConstants.EXPIRY_PAD_MS
-        self._bearer_token = self._create_bearer_auth(res[_IAMConstants.ACCESS_TOKEN])
-
-    def _create_bearer_auth(self, token):
-        return _IAMConstants.AUTH_BEARER_PREFIX + token
-
-    def _get_token_params(self, api_key):
-        return parse.urlencode({_IAMConstants.GRANT_PARAM : _IAMConstants.GRANT_TYPE,
-                                       _IAMConstants.API_KEY : api_key})
-
-    def make_request(self, url):
-        logger.debug('Beginning a REST request to: ' + url)
-        headers={'Authorization' : self._get_authorization(),
-                 'Accept': 'application/json'}
-        res = self.session.get(url, headers=headers)
-        self.handle_http_errors(res)
-        return res.json()
-
-    def make_raw_streaming_request(self, url, mimetype=None):
-        logger.debug('Beginning a REST request to: ' + url)
-        headers = {'Authorization' : self._get_authorization()}
-        if mimetype:
-            headers['Accept'] = mimetype
-        res = self.session.get(url, stream=True, headers=headers)
-        self.handle_http_errors(res)
-        return res
-
-    def __str__(self):
-        return pformat(self.__dict__)
+        super(_IAMStreamsRestClient, self).__init__(_IAMAuthHandler(credentials))
 
 
 class _ViewDataFetcher(object):
@@ -305,7 +424,12 @@ class _ViewDataFetcher(object):
         self.view = view
         self.tuple_getter = tuple_getter
         self.stop = threading.Event()
-        self.items = queue.Queue()
+        if view.bufferCapacityUnits == 'tuples':
+            self.items = queue.Queue(view.bufferCapacityTuples)
+        elif view.bufferCapacityUnits == 'seconds':
+            self.items = queue.Queue(view.bufferCapacitySeconds * view.maximumTupleRate)
+        else:
+            self.items = queue.Queue(10000)
 
         self._last_collection_time = -1
         self._last_collection_time_count = 0
@@ -314,7 +438,18 @@ class _ViewDataFetcher(object):
         while not self._stopped():
             _items = self._get_deduplicated_view_items() or []
             for itm in _items:
-                self.items.put(itm)
+                try:
+                    self.items.put(itm, block=False)
+                except queue.Full:
+                    # Pop an item (and discard)
+                    try:
+                        self.items.get(block=False)
+                    except queue.Empty:
+                        pass
+                    # Should not block as this should be
+                    # the only producer
+                    self.items.put(itm)
+              
             time.sleep(1)
 
     def _get_deduplicated_view_items(self):
@@ -427,7 +562,8 @@ class View(_ResourceElement):
         Returns:
             Domain: Streams domain for the instance owning this view.
         """
-        return Domain(self.rest_client.make_request(self.domain), self.rest_client)
+        if hasattr(self, 'domain'):
+            return Domain(self.rest_client.make_request(self.domain), self.rest_client)
 
     def get_instance(self):
         """Get the Streams instance that owns this view.
@@ -448,21 +584,151 @@ class View(_ResourceElement):
     def stop_data_fetch(self):
         """Stops the thread that fetches data from the Streams view server.
         """
-        if self._data_fetcher is not None:
+        if self._data_fetcher:
             self._data_fetcher.stop.set()
             self._data_fetcher = None
 
     def start_data_fetch(self):
         """Starts a thread that fetches data from the Streams view server.
 
+        Each item in the returned `Queue` represents a single tuple
+        on the stream the view is attached to.
+        
         Returns:
             queue.Queue: Queue containing view data.
+
+        .. note:: This is a queue of the tuples coverted to Python
+            objects, it is not a queue of :py:class:`ViewItem` objects.
         """
         self.stop_data_fetch()
         self._data_fetcher = _ViewDataFetcher(self, self._tuple_fn)
         t = threading.Thread(target=self._data_fetcher)
         t.start()
         return self._data_fetcher.items
+
+    def fetch_tuples(self, max_tuples=20, timeout=None):
+        """
+        Fetch a number of tuples from this view.
+
+        Fetching of data must have been started with
+        :py:meth:`start_data_fetch` before calling this method.
+
+        If ``timeout`` is ``None`` then the returned list will
+        contain ``max_tuples`` tuples. Otherwise if the timeout is reached
+        the list may contain less than ``max_tuples`` tuples.
+
+        Args:
+            max_tuples(int): Maximum number of tuples to fetch.
+            timeout(float): Maximum time to wait for ``max_tuples`` tuples.
+
+        Returns:
+            list: List of fetched tuples.
+        .. versionadded:: 1.12
+        """
+        tuples = list()
+        if timeout is None:
+            while len(tuples) < max_tuples:
+                fetcher = self._data_fetcher
+                if not fetcher:
+                    break
+                tuples.append(fetcher.items.get())
+            return tuples
+
+        timeout = float(timeout)
+        end = time.time() + timeout
+        while len(tuples) < max_tuples:
+            qto = end - time.time()
+            if qto <= 0:
+                break
+            try:
+                fetcher = self._data_fetcher
+                if not fetcher:
+                    break
+                tuples.append(fetcher.items.get(timeout=qto))
+            except queue.Empty:
+                break
+        return tuples
+
+    def display(self, duration=None, period=2):
+        """Display a view within a Jupyter or IPython notebook.
+
+        Provides an easy mechanism to visualize data on a stream
+        using a view.
+
+        Tuples are fetched from the view and displayed in a table
+        within the notebook cell using a ``pandas.DataFrame``.
+        The table is continually updated with the latest tuples from the view.
+
+        This method calls :py:meth:`start_data_fetch` and will call
+        :py:meth:`stop_data_fetch` when completed if `duration` is set.
+
+        Args:
+            duration(float): Number of seconds to fetch and display tuples. If ``None`` then the display will be updated until :py:meth:`stop_data_fetch` is called.
+            period(float): Maximum update period.
+
+        .. note::
+            A view is a sampling of data on a stream so tuples that
+            are on the stream may not appear in the view.
+
+        .. note::
+            Python modules `ipywidgets` and `pandas` must be installed
+            in the notebook environment.
+          
+        .. warning::
+            Behavior when called outside a notebook is undefined.
+
+        .. versionadded:: 1.12
+        """
+        import ipywidgets as widgets
+        vn = widgets.Text(value=self.description, description=self.name, disabled=True)
+        active = widgets.Valid(value=True, description='Fetching', readout='Stopped')
+        out = widgets.Output(layout={'border': '1px solid black'})
+        hb = widgets.HBox([vn, active])
+        vb = widgets.VBox([hb, out])
+        display(vb)
+        self._display_thread = threading.Thread(target=lambda: self._display(out, duration, period, active))
+        self._display_thread.start()
+        
+    def _display(self, out, duration, period, active):
+        import pandas as pd
+        import IPython
+        tqueue = self.start_data_fetch()
+        end = time.time() + float(duration) if duration is not None else None
+        max_rows = pd.options.display.max_rows
+        last = 0
+        try:
+            while self._data_fetcher and (duration is None or time.time() < end):
+                # Slow down pace when view is busy
+                gap = time.time() - last
+                if gap < period:
+                    time.sleep(period - gap)
+                # Display latest tuples by removing earlier ones
+                # Avoids display falling behind live data with
+                # large view buffer
+                tqs = tqueue.qsize()
+                if tqs > max_rows:
+                    tqs -= max_rows
+                    for _ in range(tqs):
+                        try:
+                            tqueue.get(block=False)
+                        except queue.Empty:
+                            break
+                tuples = self.fetch_tuples(max_rows, period)
+                if not tuples:
+                    if not self._data_fetcher:
+                        break
+                    out.append_stdout('No tuples')
+                else:
+                    out.append_display_data(pd.DataFrame(tuples))
+                out.clear_output(wait=True)
+                last = time.time()
+        except Exception as e:
+            self.stop_data_fetch()
+            active.value=False
+            raise e
+ 
+        self.stop_data_fetch()
+        active.value=False
 
     def get_view_items(self):
         """Get a list of :py:class:`ViewItem` elements associated with this view.
@@ -557,7 +823,7 @@ class Job(_ResourceElement):
             dir (str): a valid directory in which to save the archive. Defaults to the current directory.
 
         Returns:
-            str: the path to the created tar file, or None if retrieving a job's logs is not supported in the version of streams to which the job is submitted.
+            str: the path to the created tar file, or ``None`` if retrieving a job's logs is not supported in the version of IBM Streams to which the job is submitted.
 
         .. versionadded:: 1.8
         """
@@ -572,14 +838,14 @@ class Job(_ResourceElement):
             return None
 
     def get_views(self, name=None):
-        """Get the list of :py:class:`View` elements associated with this job.
+        """Get the list of :py:class:`~streamsx.rest_primitives.View` elements associated with this job.
 
         Args:
             name(str, optional): Returns view(s) matching `name`.  `name` can be a regular expression.  If `name`
             is not supplied, then all views associated with this instance are returned.
 
         Returns:
-            list(View): List of views matching `name`.
+            list(streamsx.rest_primitives.View): List of views matching `name`.
 
         Retrieving a list of views that contain the string "temperatureSensor" could be performed as followed
         Example:
@@ -597,7 +863,8 @@ class Job(_ResourceElement):
         Returns:
             Domain: Streams domain that owns this job.
         """
-        return Domain(self.rest_client.make_request(self.domain), self.rest_client)
+        if hasattr(self, 'domain'):
+            return Domain(self.rest_client.make_request(self.domain), self.rest_client)
 
     def get_instance(self):
         """Get the Streams instance that owns this job.
@@ -613,7 +880,8 @@ class Job(_ResourceElement):
         Returns:
             list(Host): List of Host elements associated with this job.
         """
-        return self._get_elements(self.hosts, 'hosts', Host)
+        if hasattr(self, 'hosts'):
+            return self._get_elements(self.hosts, 'hosts', Host)
 
     def get_operator_connections(self):
         """Get the list of :py:class:`OperatorConnection` elements associated with this job.
@@ -668,7 +936,8 @@ class Job(_ResourceElement):
         Returns:
             list(ResourceAllocation): List of ResourceAllocation elements associated with this job.
         """
-        return self._get_elements(self.resourceAllocations, 'resourceAllocations', ResourceAllocation)
+        if hasattr(self, 'resourceAllocations'):
+            return self._get_elements(self.resourceAllocations, 'resourceAllocations', ResourceAllocation)
 
     def cancel(self, force=False):
         """Cancel this job.
@@ -729,7 +998,8 @@ class Operator(_ResourceElement):
 
         .. versionadded:: 1.9
         """
-        return Host(self.rest_client.make_request(self.host), self.rest_client) if self.host else None
+        if hasattr(self, 'host') and self.host:
+            return Host(self.rest_client.make_request(self.host), self.rest_client)
 
     def get_pe(self):
         """Get the Streams processing element this operator is executing in.
@@ -923,7 +1193,8 @@ class PE(_ResourceElement):
 
         .. versionadded:: 1.9
         """
-        return Host(self.rest_client.make_request(self.host), self.rest_client) if self.host else None
+        if hasattr(self, 'host') and self.host:
+            return Host(self.rest_client.make_request(self.host), self.rest_client)
 
     def retrieve_trace(self, filename=None, dir=None):
         """Retrieves the application trace files for this PE
@@ -1003,7 +1274,8 @@ class PE(_ResourceElement):
 
         .. versionadded:: 1.9
         """
-        return ResourceAllocation(self.rest_client.make_request(self.resourceAllocation), self.rest_client)
+        if hasattr(self, 'resourceAllocation'):
+            return ResourceAllocation(self.rest_client.make_request(self.resourceAllocation), self.rest_client)
 
 
 class PEConnection(_ResourceElement):
@@ -1090,7 +1362,7 @@ class ResourceAllocation(_ResourceElement):
 
 
 class ActiveService(_ResourceElement):
-    """Domain or an instance service.
+    """Domain or instance service.
 
     Attributes:
         resourceType(str): Identifies the REST resource type, which is *activeService*.
@@ -1231,6 +1503,116 @@ class Instance(_ResourceElement):
         super(Instance, self).__init__(json_rep, rest_client)
         self._delegator = rest_client._sc._delegator
 
+    @staticmethod
+    def _is_service_def(config):
+        return 'connection_info' in config and config.get('type', None) == 'streams' and 'service_token' in config
+
+    @staticmethod
+    def _find_service_def(config):
+        if Instance._is_service_def(config):
+            service = config
+        else:
+            service = config.get(streamsx.topology.context.ConfigParams.SERVICE_DEFINITION)
+
+        if service and Instance._is_service_def(service):
+            svc_info = {}
+            svc_info['connection_info'] = service['connection_info']
+            svc_info['type'] = service['type']
+            try:
+                from icpd_core import icpd_util
+                svc_name = service['connection_info']['serviceRestEndpoint'].split('/')[-1]
+                svc_info['service_token'] = icpd_util.get_instance_token(name=svc_name)
+            except:
+                svc_info['service_token'] = service['service_token']
+            if 'user_token' in service:
+                svc_info['user_token'] = service['user_token']
+            return svc_info
+        return None
+
+    @staticmethod
+    def _clear_service_info(config):
+        del config['connection_info']
+        del config['type']
+        del config['service_token']
+        if hasattr(config, 'user_token'):
+            config.pop('user_token')
+
+    @staticmethod
+    def of_service(config):
+        """Connect to an IBM Streams service instance running in IBM Cloud Private for Data.
+
+        The instance is specified in `config`. The configuration may be code injected from the list of services
+        in a Jupyter notebook running in ICPD or manually created. The code that selects a service instance by name is::
+
+            # Two lines are code injected in a Jupyter notebook by selecting the service instance
+            from icpd_core import ipcd_util
+            cfg = icpd_util.get_service_details(name='instanceName')
+
+            instance = Instance.of_service(cfg)
+
+        SSL host verification is disabled by setting :py:const:`~streamsx.topology.context.ConfigParams.SSL_VERIFY`
+        to ``False`` within `config` before calling this method::
+
+            cfg[ConfigParams.SSL_VERIFY] = False
+            instance = Instance.of_service(cfg)
+
+        Args:
+            config(dict): Configuration of IBM Streams service instance.
+
+        Returns:
+            Instance: Instance representing for IBM Streams service instance.
+
+        .. note:: Only supported when running within the ICPD cluster,
+            for example in a Jupyter notebook within a ICPD project.
+
+        .. versionadded:: 1.12
+        """
+        service = Instance._find_service_def(config)
+        if not service:
+            raise ValueError()
+        endpoint = service['connection_info'].get('serviceRestEndpoint')
+        resource_url, name = Instance._root_from_endpoint(endpoint)
+
+        sc = streamsx.rest.StreamsConnection(resource_url=resource_url, auth=_ICPDAuthHandler(name, service['service_token']))
+        if streamsx.topology.context.ConfigParams.SSL_VERIFY in config:
+                sc.session.verify = config[streamsx.topology.context.ConfigParams.SSL_VERIFY]
+        return sc.get_instance(name)
+
+    @staticmethod
+    def _root_from_endpoint(endpoint):
+        import urllib.parse as up
+        esu = up.urlsplit(endpoint)
+        if not esu.path.startswith('/streams/rest/instances/'):
+            return None, None
+
+        es = endpoint.split('/')
+        name = es[len(es)-1]
+        root_url = endpoint.split('/streams/rest/instances/')[0]
+        resource_url = root_url + '/streams/rest/resources'
+        return resource_url, name
+
+    @staticmethod
+    def of_endpoint(endpoint=None, username=None, password=None, verify=None):
+        if not endpoint:
+            endpoint = os.environ.get('STREAMS_REST_URL')
+        if not endpoint:
+            return None
+        if not password:
+            password = os.environ.get('STREAMS_PASSWORD')
+        if not password:
+            return None
+        username = _get_username(username)
+
+        resource_url, name = Instance._root_from_endpoint(endpoint)
+        if resource_url is None:
+            return None
+        sc = streamsx.rest.StreamsConnection(resource_url=resource_url,
+                                             auth=_ICPDExternalAuthHandler(endpoint, username, password))
+        if verify is not None:
+            sc.rest_client.session.verify = verify
+ 
+        return sc.get_instance(name)
+
     def get_operators(self, name=None):
         """Get the list of :py:class:`Operator` elements associated with this instance.
 
@@ -1277,14 +1659,14 @@ class Instance(_ResourceElement):
         return self._get_elements(self.peConnections, 'connections', PEConnection)
 
     def get_views(self, name=None):
-        """Get the list of :py:class:`View` elements associated with this instance.
+        """Get the list of :py:class:`~streamsx.rest_primitives.View` elements associated with this instance.
 
         Args:
             name(str, optional): Returns view(s) matching `name`.  `name` can be a regular expression.  If `name`
             is not supplied, then all views associated with this instance are returned.
 
         Returns:
-            list(View): List of views matching `name`.
+            list(streamsx.rest_primitives.View): List of views matching `name`.
 
         Retrieving a list of views whose name contains the string "temperatureSensor" could be performed as followed
         Example:
@@ -1301,7 +1683,8 @@ class Instance(_ResourceElement):
         Returns:
             list(Host): List of Host element associated with this instance.
         """
-        return self._get_elements(self.hosts, 'hosts', Host)
+        if hasattr(self, 'hosts'):
+            return self._get_elements(self.hosts, 'hosts', Host)
 
     def get_domain(self):
         """Get the Streams domain that owns this instance.
@@ -1309,7 +1692,8 @@ class Instance(_ResourceElement):
         Returns:
             Domain: Streams domain owning this instance.
         """
-        return Domain(self.rest_client.make_request(self.domain), self.rest_client)
+        if hasattr(self, 'domain'):
+            return Domain(self.rest_client.make_request(self.domain), self.rest_client)
 
     def get_jobs(self, name=None):
         """Retrieves jobs running in this instance.
@@ -1366,7 +1750,8 @@ class Instance(_ResourceElement):
         Returns:
             list(ActiveService): List of ActiveService elements associated with this instance.
         """
-        return self._get_elements(self.activeServices, 'activeServices', ActiveService)
+        if hasattr(self, 'activeServices'):
+            return self._get_elements(self.activeServices, 'activeServices', ActiveService)
 
     def get_resource_allocations(self):
         """Get the list of :py:class:`ResourceAllocation` elements associated with this instance.
@@ -1374,7 +1759,8 @@ class Instance(_ResourceElement):
         Returns:
             list(ResourceAllocation): List of ResourceAllocation elements associated with this instance.
         """
-        return self._get_elements(self.resourceAllocations, 'resourceAllocations', ResourceAllocation)
+        if hasattr(self, 'resourceAllocations'):
+            return self._get_elements(self.resourceAllocations, 'resourceAllocations', ResourceAllocation)
 
     def get_published_topics(self):
         """Get a list of published topics for this instance.
@@ -1454,6 +1840,40 @@ class Instance(_ResourceElement):
         .. versionadded:: 1.11
         """
         return self.upload_bundle(bundle).submit_job(job_config)
+
+    def get_application_configurations(self, name=None):
+        """Retrieves application configurations for this instance.
+
+        Args:
+            name (str, optional): Only return application configurations containing property **name** that matches `name`. `name` can be a
+                regular expression. If `name` is not supplied, then all application configurations are returned.
+
+        Returns:
+            list(ApplicationConfiguration): A list of application configurations matching the given `name`.
+        
+        .. versionadded 1.12
+        """
+        if hasattr(self, 'applicationConfigurations'):
+           return self._get_elements(self.applicationConfigurations, 'applicationConfigurations', ApplicationConfiguration, None, name)
+
+    def create_application_configuration(self, name, properties, description=None):
+        """Create an application configuration.
+
+        Args:
+            name (str, optional): Only return application configurations containing property **name** that matches `name`. `name` can be a
+        .. versionadded 1.12
+        """
+        if not hasattr(self, 'applicationConfigurations'):
+            raise NotImplementedError()
+
+        cv = ApplicationConfiguration._props(name, properties, description)
+
+        res = self.rest_client.session.post(self.applicationConfigurations,
+            headers = {'Accept' : 'application/json'},
+            json=cv)
+        _handle_http_errors(res)
+        return ApplicationConfiguration(res.json(), self.rest_client)
+
 
 class ResourceTag(object):
     """Resource tag defined in a Streams domain
@@ -1559,7 +1979,8 @@ class Domain(_ResourceElement):
         Returns:
             list(Host): List of Host elements associated with this domain.
         """
-        return self._get_elements(self.hosts, 'hosts', Host)
+        if hasattr(self, 'hosts'):
+            return self._get_elements(self.hosts, 'hosts', Host)
 
     def get_active_services(self):
         """Get the list of :py:class:`ActiveService` elements associated with this domain.
@@ -1567,7 +1988,8 @@ class Domain(_ResourceElement):
         Returns:
             list(ActiveService): List of ActiveService elements associated with this domain.
         """
-        return self._get_elements(self.activeServices, 'activeServices', ActiveService)
+        if hasattr(self, 'activeServices'):
+            return self._get_elements(self.activeServices, 'activeServices', ActiveService)
 
     def get_resource_allocations(self):
         """Get the list of :py:class:`ResourceAllocation` elements associated with this domain.
@@ -1575,7 +1997,8 @@ class Domain(_ResourceElement):
         Returns:
             list(ResourceAllocation): List of ResourceAllocation elements associated with this domain.
         """
-        return self._get_elements(self.resourceAllocations, 'resourceAllocations', ResourceAllocation)
+        if hasattr(self, 'resourceAllocations'):
+            return self._get_elements(self.resourceAllocations, 'resourceAllocations', ResourceAllocation)
 
     def get_resources(self):
         """Get the list of :py:class:`Resource` elements associated with this domain.
@@ -1730,7 +2153,13 @@ class _StreamingAnalyticsServiceV2Delegator(object):
         return sr['id']
 
     def _cancel_job(self, job, force):
-        return self.cancel_job(job_id=job.id)
+        try:
+            self.cancel_job(job_id=job.id)
+            return True
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 404:
+                return False
+            raise
 
     def _submit_job(self, bundle, job_config):
         sab_name = os.path.basename(bundle)
@@ -1743,9 +2172,9 @@ class _StreamingAnalyticsServiceV2Delegator(object):
                 ('job_options', ('job_options', json.dumps(job_options), 'application/json'))
                 ]
             res = self.rest_client.session.post(self._get_jobs_url(),
-                headers = {'Authorization' : self.rest_client._get_authorization(), 'Accept' : 'application/json'},
+                headers = {'Accept' : 'application/json'},
                 files=files)
-            self.rest_client.handle_http_errors(res)
+            _handle_http_errors(res)
             return res.json()
 
 
@@ -1756,7 +2185,7 @@ class _StreamingAnalyticsServiceV2Delegator(object):
         if job_id is None:
             # Get the job id using the job name, since it's required by the REST API
             res = self.rest_client.make_request(self.get_jobs_url())
-            self.rest_client.handle_http_errors(res)
+            _handle_http_errors(res)
             for job in res['resources']:
                 if job['name'] == job_name:
                     # Find the correct job_id, set it
@@ -1764,26 +2193,24 @@ class _StreamingAnalyticsServiceV2Delegator(object):
 
         # Cancel the job using the job id
         cancel_url = self._get_jobs_url() + '/' + str(job_id)
-        headers = {'Authorization' : self.rest_client._get_authorization(),
-                  'Accept' : 'application/json'}
+        headers = { 'Accept' : 'application/json'}
         res = self.rest_client.session.delete(cancel_url, headers=headers)
-        self.rest_client.handle_http_errors(res)
+        _handle_http_errors(res)
         return res.json()
 
     def start_instance(self):
         res = self.rest_client.session.patch(self._v2_rest_url, json={'state' : 'STARTED'},
-                               headers = {'Authorization' : self.rest_client._get_authorization(),
+                               headers = {
                                           'Content-Type' : 'application/json',
                                           'Accept' : 'application/json'})
-        self.rest_client.handle_http_errors(res)
+        _handle_http_errors(res)
         return res.json()
 
     def stop_instance(self):
         res = self.rest_client.session.patch(self._v2_rest_url, json={'state' : 'STOPPED'},
-                               headers = {'Authorization' : self.rest_client._get_authorization(),
-                                          'Content-Type' : 'application/json',
+                               headers = { 'Content-Type' : 'application/json',
                                           'Accept' : 'application/json'})
-        self.rest_client.handle_http_errors(res)
+        _handle_http_errors(res)
         return res.json()
 
     def get_instance_status(self):
@@ -1853,7 +2280,7 @@ class _StreamingAnalyticsServiceV1Delegator(object):
 
         jobs_url = self._get_url('jobs_path')
         res = self.rest_client.session.delete(jobs_url, params=payload)
-        self.rest_client.handle_http_errors(res)
+        _handle_http_errors(res)
         return res.json()
 
     def start_instance(self):
@@ -1864,7 +2291,7 @@ class _StreamingAnalyticsServiceV1Delegator(object):
         """
         start_url = self._get_url('start_path')
         res = self.rest_client.session.put(start_url, json={})
-        self.rest_client.handle_http_errors(res)
+        _handle_http_errors(res)
         return res.json()
 
     def stop_instance(self):
@@ -1875,7 +2302,7 @@ class _StreamingAnalyticsServiceV1Delegator(object):
         """
         stop_url = self._get_url('stop_path')
         res = self.rest_client.session.put(stop_url, json={})
-        self.rest_client.handle_http_errors(res)
+        _handle_http_errors(res)
         return res.json()
 
     def get_instance_status(self):
@@ -1886,7 +2313,7 @@ class _StreamingAnalyticsServiceV1Delegator(object):
         """
         status_url = self._get_url('status_path')
         res = self.rest_client.session.get(status_url)
-        self.rest_client.handle_http_errors(res)
+        _handle_http_errors(res)
         return res.json()
 
 class _IAMConstants(object):
@@ -1911,27 +2338,15 @@ class _IAMConstants(object):
     """The key of the bearer authentication token in the IAM token response.
     """
 
-    AUTH_BEARER_PREFIX = 'Bearer '
-    """The prefix to append to the bearer token retrieved from IAM when setting the Authentication 
-    HTTP header.
-    """
-
     GRANT_PARAM = 'grant_type'
     GRANT_TYPE = 'urn:ibm:params:oauth:grant-type:apikey'
 
-    TOKEN_URL = 'https://iam.bluemix.net/oidc/token'
-    """The url from which to receive bearer authentication tokens for Authorizing REST requests on
-    IBM Cloud.
+    TOKEN_URL = 'https://iam.cloud.ibm.com/oidc/token'
+    """The url from which to receive bearer authentication tokens for Authorizing REST requests on production IBM Cloud.
     """
 
-    TOKEN_URL_STAGE1 = 'https://iam.stage1.bluemix.net/oidc/token'
-    """The url from which to receive bearer authentication tokens for Authorizing REST requests on
-    stage1 IBM Cloud.
-    """
-
-    EXPIRY_PAD_MS = 300000
-    """Padding to ensure that a new IAM token is retrieved when the current token is due to expire
-    in less than five minutes.
+    TOKEN_URL_TEST = 'https://iam.test.cloud.ibm.com/oidc/token'
+    """The url from which to receive bearer authentication tokens for Authorizing REST requests on test/staging IBM Cloud.
     """
 
 class ApplicationBundle(_ResourceElement):
@@ -2009,16 +2424,75 @@ class _StreamsV4Delegator(object):
                 domain_id=job.get_instance().get_domain().id, instance_id=job.get_instance().id)
         return False
 
+
 class _UploadedBundle(ApplicationBundle):
     def _app_id(self):
-        app_id = self.application
-        if app_id is None:
-            self.refresh()
-            app_id = self.application
+        return self.bundleId
 
-        # One time use only
-        self.json_rep['application'] = None
-        return app_id
+class ApplicationConfiguration(_ResourceElement):
+    """An application configuration.
+   
+    Application configurations are used for secure storage and
+    retrieval of name/value pairs.
+
+    An application configuration maintains a set of properties
+    that an application can access at runtime. These are typically
+    used to maintain connection endpoint and credentials for sources
+    and sinks.
+
+    Attributes:
+        name (str): Name of the configuration.
+        description (str): Description for the configuration.
+        properties (dict): Property values stored for the configuration.
+        creationTime (long): Epoch time when this configuraiton was created.
+        lastModifiedTime (long): Epoch time when this configuration was last modified.
+
+    .. versionadded 1.12
+    """
+    @staticmethod
+    def _props(name=None, properties=None, description=None):
+        cv = {}
+        if name:
+            cv['name'] = str(name)
+        if description:
+            cv['description'] = str(description)
+        acp = {}
+        for k,v in properties.items():
+            acp[str(k)] = None if v is None else str(v)
+        cv['properties'] = acp
+        return cv
+
+    def update(self, properties=None, description=None):
+        """Update this application configuration.
+
+        To create or update a property provide its key-value
+        pair in `properties`.
+
+        To delete a property provide its key with the value ``None``
+        in properties.
+
+        Args:
+            properties (dict): Property values to be updated. If ``None`` the properties are unchanged.
+            description (str): Description for the configuration. If ``None`` the description is unchanged.
+
+        Returns:
+            ApplicationConfiguration: self
+        """
+        cv = ApplicationConfiguration._props(properties=properties, description=description)
+        res = self.rest_client.session.patch(self.rest_self,
+            headers = {'Accept' : 'application/json',
+                       'Content-Type' : 'application/json'},
+            json=cv)
+        _handle_http_errors(res)
+        self.json_rep = res.json()
+        return self
+
+    def delete(self):
+        """Delete this application configuration.
+        """
+        res = self.rest_client.session.delete(self.rest_self)
+        _handle_http_errors(res)
+
 
 class _StreamsRestDelegator(object):
     """Delegator for IBM Streams instances where the
@@ -2028,26 +2502,28 @@ class _StreamsRestDelegator(object):
         self.rest_client = rest_client
 
     def _upload_bundle(self, instance, bundle):
+        self.rest_client._block_ssl_warn()
         app_bundle_url = instance.self + '/applicationbundles'
 
         sab_name = os.path.basename(bundle)
         with open(bundle, 'rb') as bundle_fp:
             res = self.rest_client.session.post(app_bundle_url,
-                headers = {'Authorization' : self.rest_client._get_authorization(), 'Accept' : 'application/json', 'Content-Type': 'application/x-jar'},
-                data=bundle_fp)
-            self.rest_client.handle_http_errors(res)
-            if res.status_code != 201:
+                headers = {'Accept' : 'application/json', 'Content-Type': 'application/x-jar'},
+                data=bundle_fp,
+                verify=self.rest_client.session.verify)
+            _handle_http_errors(res)
+            if res.status_code != 200:
                 raise ValueError(str(res))
-            location = res.headers['Location']
-            json_rep = self.rest_client.make_request(location)
-            return _UploadedBundle(self, instance, json_rep, self.rest_client)
+            return _UploadedBundle(self, instance, res.json(), self.rest_client)
 
     def _submit_bundle(self, bundle, job_config):
+        self.rest_client._block_ssl_warn()
         job_options = job_config.as_overlays() if job_config else {}
         app_id = bundle._app_id()
         res = self.rest_client.session.post(bundle._instance.jobs,
-           headers = {'Authorization' : self.rest_client._get_authorization(), 'Accept' : 'application/json'}, json={'application': app_id, 'jobConfigurationOverlay':job_options, 'preview':False})
-        self.rest_client.handle_http_errors(res)
+            headers = {'Accept' : 'application/json'}, json={'application': app_id, 'jobConfigurationOverlay':job_options, 'preview':False},
+            verify=self.rest_client.session.verify)
+        _handle_http_errors(res)
         if res.status_code != 201:
             raise ValueError(str(res))
         location = res.headers['Location']
@@ -2056,7 +2532,17 @@ class _StreamsRestDelegator(object):
         return job.id
 
     def _cancel_job(self, job, force):
+        self.rest_client._block_ssl_warn()
         cancel_url = job.instance + '/jobs/' + job.id
         res = self.rest_client.session.delete(cancel_url,
-                headers = {'Authorization' : self.rest_client._get_authorization(), 'Accept' : 'application/json'})
-        #TODO return code
+                headers = {'Accept' : 'application/json'},
+                verify=self.rest_client.session.verify)
+
+        if res.status_code == 204:
+            return True
+        if res.status_code == 404:
+            return False
+
+        res.raise_for_status()
+
+        return False

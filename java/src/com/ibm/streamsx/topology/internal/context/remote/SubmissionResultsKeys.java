@@ -27,6 +27,11 @@ public interface SubmissionResultsKeys {
     String JOB_ID = "jobId";
     
     /**
+     * The instance id for the submitted job.
+     */
+    String INSTANCE_ID = "instanceId";
+    
+    /**
      * The file path of the Job config file.
      */
     String JOB_CONFIG_PATH = "jobConfigPath";
@@ -34,6 +39,7 @@ public interface SubmissionResultsKeys {
     /**
      * JSON object holding metrics related to build/job submission.
      */
+    String BUILD_STATUS = "buildStatus";
     String SUBMIT_METRICS = "submitMetrics";
     String TIME_MS_SUFFIX = "Time_ms";
             
@@ -47,6 +53,7 @@ public interface SubmissionResultsKeys {
     String SUBMIT_UPLOAD_TIME = "buildArchiveUpload" + TIME_MS_SUFFIX;
     String SUBMIT_TOTAL_BUILD_TIME = "totalBuild" + TIME_MS_SUFFIX;
     String SUBMIT_JOB_TIME = "jobSubmission" + TIME_MS_SUFFIX;
+    String DOWNLOAD_SABS_TIME = "downloadSabs" + TIME_MS_SUFFIX;
     
     /**
      * Separate build state times in SUBMIT_METRICS
